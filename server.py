@@ -2,181 +2,174 @@ from fastapi import FastAPI, Request, Form
 from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from datetime import datetime, date, timedelta
-import os
-import sqlite3
+import os, sqlite3
+
 import psycopg2
 from psycopg2.extras import RealDictCursor
 from starlette.middleware.sessions import SessionMiddleware
 from passlib.context import CryptContext
-
 
 # ---------------- CONFIG ----------------
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DB_PATH = os.path.join(BASE_DIR, "rastro.db")
 
-DATABASE_URL = os.getenv("DATABASE_URL")  # Railway
+DATABASE_URL = os.getenv("DATABASE_URL")  # en Railway/Supabase
 APP_SECRET = os.getenv("APP_SECRET", "dev-secret")
 
 IS_POSTGRES = bool(DATABASE_URL)
 
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
+# ---------------- APP ----------------
+
+app = FastAPI()
+app.add_middleware(SessionMiddleware, secret_key=APP_SECRET)
+
+# static (no debe crashear si no hay logo)
+STATIC_DIR = os.path.join(BASE_DIR, "static")
+os.makedirs(STATIC_DIR, exist_ok=True)
+app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
+
 
 # ---------------- DB HELPERS ----------------
 
 def get_conn():
+    """
+    Si existe DATABASE_URL -> Postgres (Supabase/Railway)
+    Si NO existe -> SQLite local (rastro.db)
+    """
     if IS_POSTGRES:
         return psycopg2.connect(
             DATABASE_URL,
             sslmode="require",
-            cursor_factory=RealDictCursor
+            cursor_factory=RealDictCursor,
         )
-    else:
-        conn = sqlite3.connect(DB_PATH)
-        conn.row_factory = sqlite3.Row
-        return conn
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
 
 
 def db_execute(cur, query: str, params=()):
-    # SQLite usa ?, psycopg2 usa %s
+    """
+    Escribe consultas con '?' siempre.
+    En Postgres se convierte a %s automáticamente.
+    """
     if IS_POSTGRES:
         query = query.replace("?", "%s")
     cur.execute(query, params)
 
 
-def db_fetchone(cur):
-    row = cur.fetchone()
-    if row is None:
-        return None
-    if IS_POSTGRES:
-        return row
-    return dict(row)
-
-
-def db_fetchall(cur):
-    rows = cur.fetchall()
-    if IS_POSTGRES:
-        return rows
-    return [dict(r) for r in rows]
-
-
-def db_insert_returning_id(cur, query: str, params=()):
+def insert_and_get_id(cur, query: str, params=()):
     """
-    Inserta y regresa ID:
+    Inserta y regresa el ID creado.
     - SQLite: lastrowid
     - Postgres: RETURNING id
     """
     if IS_POSTGRES:
-        q = query.strip().rstrip(";")
-        if "returning" not in q.lower():
-            q += " RETURNING id"
-        db_execute(cur, q, params)
+        q = query.replace("?", "%s").rstrip().rstrip(";") + " RETURNING id"
+        cur.execute(q, params)
         row = cur.fetchone()
-        return row["id"] if row else None
-    else:
-        db_execute(cur, query, params)
-        return cur.lastrowid
+        return row["id"]
+    cur.execute(query, params)
+    return cur.lastrowid
 
 
 def init_db():
-    """
-    Crea tablas si no existen (SQLite local y Postgres Railway).
-    Esto te quita el 'You have no tables' y evita 500 en botones.
-    """
     conn = get_conn()
     cur = conn.cursor()
 
     if IS_POSTGRES:
-        db_execute(cur, """
-        CREATE TABLE IF NOT EXISTS productos (
-            id SERIAL PRIMARY KEY,
-            nombre TEXT NOT NULL,
-            codigo TEXT UNIQUE NOT NULL
-        )
-        """)
-        db_execute(cur, """
+        # Tablas (Postgres)
+        cur.execute("""
         CREATE TABLE IF NOT EXISTS clientes (
             id SERIAL PRIMARY KEY,
             nombre TEXT NOT NULL,
             referencia TEXT
-        )
+        );
         """)
-        db_execute(cur, """
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS productos (
+            id SERIAL PRIMARY KEY,
+            nombre TEXT NOT NULL,
+            codigo TEXT UNIQUE NOT NULL
+        );
+        """)
+        cur.execute("""
         CREATE TABLE IF NOT EXISTS precios (
             id SERIAL PRIMARY KEY,
-            cliente_id INTEGER NULL REFERENCES clientes(id),
-            producto_id INTEGER NOT NULL REFERENCES productos(id),
-            fecha TEXT NOT NULL,
+            cliente_id INTEGER NULL,
+            producto_id INTEGER NOT NULL,
+            fecha DATE NOT NULL,
             tipo_venta TEXT NOT NULL,
             precio_por_kg NUMERIC NOT NULL
-        )
+        );
         """)
-        db_execute(cur, """
+        cur.execute("""
         CREATE TABLE IF NOT EXISTS boletas_pesaje (
             id SERIAL PRIMARY KEY,
             fecha_hora TEXT NOT NULL,
-            cliente_id INTEGER NULL REFERENCES clientes(id),
-            producto_id INTEGER NOT NULL REFERENCES productos(id),
+            cliente_id INTEGER NULL,
+            producto_id INTEGER NOT NULL,
             tipo_venta TEXT NOT NULL,
             num_pollos INTEGER NOT NULL,
             num_cajas INTEGER NOT NULL,
             peso_total_kg NUMERIC NOT NULL,
             comentarios TEXT,
             estado TEXT NOT NULL
-        )
+        );
         """)
-        db_execute(cur, """
+        cur.execute("""
         CREATE TABLE IF NOT EXISTS ventas (
             id SERIAL PRIMARY KEY,
             fecha_hora TEXT NOT NULL,
-            boleta_id INTEGER NOT NULL REFERENCES boletas_pesaje(id),
-            cliente_id INTEGER NULL REFERENCES clientes(id),
-            producto_id INTEGER NOT NULL REFERENCES productos(id),
+            boleta_id INTEGER NOT NULL,
+            cliente_id INTEGER NULL,
+            producto_id INTEGER NOT NULL,
             peso_neto_kg NUMERIC NOT NULL,
             precio_por_kg NUMERIC NOT NULL,
             total NUMERIC NOT NULL,
             metodo_pago TEXT NOT NULL
-        )
+        );
         """)
-        db_execute(cur, """
+        cur.execute("""
         CREATE TABLE IF NOT EXISTS movimientos_cliente (
             id SERIAL PRIMARY KEY,
             fecha_hora TEXT NOT NULL,
-            cliente_id INTEGER NOT NULL REFERENCES clientes(id),
+            cliente_id INTEGER NOT NULL,
             tipo TEXT NOT NULL,
             referencia_id INTEGER NOT NULL,
             monto NUMERIC NOT NULL
-        )
+        );
         """)
-        db_execute(cur, """
+        cur.execute("""
         CREATE TABLE IF NOT EXISTS devoluciones (
             id SERIAL PRIMARY KEY,
             fecha_hora TEXT NOT NULL,
-            venta_id INTEGER NOT NULL REFERENCES ventas(id),
-            cliente_id INTEGER NULL REFERENCES clientes(id),
+            venta_id INTEGER NOT NULL,
+            cliente_id INTEGER NULL,
             peso_devuelto_kg NUMERIC NOT NULL,
             monto_devuelto NUMERIC NOT NULL,
             motivo TEXT
-        )
+        );
         """)
     else:
-        # SQLite
-        db_execute(cur, """
-        CREATE TABLE IF NOT EXISTS productos (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            nombre TEXT NOT NULL,
-            codigo TEXT UNIQUE NOT NULL
-        )
-        """)
-        db_execute(cur, """
+        # Tablas (SQLite)
+        cur.execute("""
         CREATE TABLE IF NOT EXISTS clientes (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             nombre TEXT NOT NULL,
             referencia TEXT
-        )
+        );
         """)
-        db_execute(cur, """
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS productos (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            nombre TEXT NOT NULL,
+            codigo TEXT UNIQUE NOT NULL
+        );
+        """)
+        cur.execute("""
         CREATE TABLE IF NOT EXISTS precios (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             cliente_id INTEGER NULL,
@@ -184,9 +177,9 @@ def init_db():
             fecha TEXT NOT NULL,
             tipo_venta TEXT NOT NULL,
             precio_por_kg REAL NOT NULL
-        )
+        );
         """)
-        db_execute(cur, """
+        cur.execute("""
         CREATE TABLE IF NOT EXISTS boletas_pesaje (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             fecha_hora TEXT NOT NULL,
@@ -198,9 +191,9 @@ def init_db():
             peso_total_kg REAL NOT NULL,
             comentarios TEXT,
             estado TEXT NOT NULL
-        )
+        );
         """)
-        db_execute(cur, """
+        cur.execute("""
         CREATE TABLE IF NOT EXISTS ventas (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             fecha_hora TEXT NOT NULL,
@@ -211,9 +204,9 @@ def init_db():
             precio_por_kg REAL NOT NULL,
             total REAL NOT NULL,
             metodo_pago TEXT NOT NULL
-        )
+        );
         """)
-        db_execute(cur, """
+        cur.execute("""
         CREATE TABLE IF NOT EXISTS movimientos_cliente (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             fecha_hora TEXT NOT NULL,
@@ -221,9 +214,9 @@ def init_db():
             tipo TEXT NOT NULL,
             referencia_id INTEGER NOT NULL,
             monto REAL NOT NULL
-        )
+        );
         """)
-        db_execute(cur, """
+        cur.execute("""
         CREATE TABLE IF NOT EXISTS devoluciones (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             fecha_hora TEXT NOT NULL,
@@ -232,34 +225,29 @@ def init_db():
             peso_devuelto_kg REAL NOT NULL,
             monto_devuelto REAL NOT NULL,
             motivo TEXT
-        )
+        );
         """)
 
-    # Productos base si no hay ninguno
-    db_execute(cur, "SELECT COUNT(*) AS n FROM productos")
-    row = db_fetchone(cur)
-    n = row["n"] if row else 0
-    if n == 0:
-        base = [
+    # Seed productos si está vacío
+    db_execute(cur, "SELECT COUNT(*) AS c FROM productos")
+    count_row = cur.fetchone()
+    count_val = count_row["c"] if isinstance(count_row, dict) else count_row["c"]
+    if int(count_val) == 0:
+        productos_seed = [
             ("Pollo entero", "POLLO_ENTERO"),
             ("Pollo vivo", "POLLO_VIVO"),
             ("Pechuga", "PECHUGA"),
             ("Pierna/Muslo", "PIERNA_MUSLO"),
             ("Alitas", "ALITAS"),
-            ("Menudencia", "MENUDENCIA"),
         ]
-        for nombre, codigo in base:
-            db_execute(cur, "INSERT INTO productos (nombre, codigo) VALUES (?, ?)", (nombre, codigo))
+        for nombre, codigo in productos_seed:
+            insert_and_get_id(cur,
+                "INSERT INTO productos (nombre, codigo) VALUES (?, ?)",
+                (nombre, codigo)
+            )
 
     conn.commit()
     conn.close()
-
-
-# ---------------- APP ----------------
-
-app = FastAPI()
-app.add_middleware(SessionMiddleware, secret_key=APP_SECRET)
-app.mount("/static", StaticFiles(directory="static"), name="static")
 
 
 @app.on_event("startup")
@@ -267,7 +255,7 @@ def _startup():
     init_db()
 
 
-# ---------- LAYOUT / PLANTILLA HTML ---------- #
+# ---------- LAYOUT / HTML ---------- #
 
 def layout(title: str, body: str) -> HTMLResponse:
     html = f"""
@@ -376,8 +364,12 @@ def layout(title: str, body: str) -> HTMLResponse:
                 background-color: #f9fafb;
                 text-align: left;
             }}
-            small {{
-                color: #6b7280;
+            .error {{
+                background: #fee2e2;
+                border: 1px solid #fecaca;
+                padding: 12px;
+                border-radius: 8px;
+                color: #991b1b;
             }}
         </style>
     </head>
@@ -409,27 +401,8 @@ def layout(title: str, body: str) -> HTMLResponse:
     return HTMLResponse(content=html)
 
 
-# ---------- HOME ---------- #
-
-@app.get("/", response_class=HTMLResponse)
-def home():
-    body = """
-    <h2>Sistema Rastro Pollos (Demo sin báscula)</h2>
-    <div class="card">
-        <p>Desde aquí puedes probar el flujo:</p>
-        <ul>
-            <li>Registrar clientes (fiados / crédito)</li>
-            <li>Cargar lista de precios por día</li>
-            <li>Crear boleta de pesaje</li>
-            <li>Cobrar boletas pendientes</li>
-            <li>Ver boletas cobradas</li>
-            <li>Registrar devoluciones</li>
-            <li>Ver saldos de clientes</li>
-        </ul>
-        <p>Todo esto funciona sólo con pesos capturados a mano.</p>
-    </div>
-    """
-    return layout("Inicio", body)
+def error_card(msg: str) -> HTMLResponse:
+    return layout("Error", f"<div class='card error'><b>Error:</b> {msg}</div>")
 
 
 # ---------- UTILIDADES ---------- #
@@ -438,7 +411,7 @@ def get_productos():
     conn = get_conn()
     c = conn.cursor()
     db_execute(c, "SELECT id, nombre, codigo FROM productos ORDER BY id")
-    productos = db_fetchall(c)
+    productos = c.fetchall()
     conn.close()
     return productos
 
@@ -447,7 +420,7 @@ def get_clientes():
     conn = get_conn()
     c = conn.cursor()
     db_execute(c, "SELECT id, nombre FROM clientes ORDER BY nombre")
-    clientes = db_fetchall(c)
+    clientes = c.fetchall()
     conn.close()
     return clientes
 
@@ -456,27 +429,50 @@ def obtener_precio(cliente_id, producto_id, fecha_txt, tipo_venta):
     conn = get_conn()
     c = conn.cursor()
 
+    # 1) Precio especial por cliente
     if cliente_id is not None:
         db_execute(c, """
             SELECT precio_por_kg FROM precios
             WHERE cliente_id = ? AND producto_id = ? AND fecha = ? AND tipo_venta = ?
             ORDER BY id DESC LIMIT 1
         """, (cliente_id, producto_id, fecha_txt, tipo_venta))
-        row = db_fetchone(c)
+        row = c.fetchone()
         if row:
             conn.close()
             return float(row["precio_por_kg"])
 
+    # 2) Precio general (cliente_id NULL)
     db_execute(c, """
         SELECT precio_por_kg FROM precios
         WHERE cliente_id IS NULL AND producto_id = ? AND fecha = ? AND tipo_venta = ?
         ORDER BY id DESC LIMIT 1
     """, (producto_id, fecha_txt, tipo_venta))
-    row = db_fetchone(c)
+    row = c.fetchone()
     conn.close()
     if row:
         return float(row["precio_por_kg"])
     return None
+
+
+# ---------- HOME ---------- #
+
+@app.get("/", response_class=HTMLResponse)
+def home():
+    body = """
+    <h2>Sistema Rastro Pollos</h2>
+    <div class="card">
+        <p>Flujo:</p>
+        <ul>
+            <li>Registrar clientes</li>
+            <li>Cargar lista de precios por día</li>
+            <li>Crear boleta de pesaje</li>
+            <li>Cobrar boletas pendientes</li>
+            <li>Registrar devoluciones</li>
+            <li>Ver saldos de clientes</li>
+        </ul>
+    </div>
+    """
+    return layout("Inicio", body)
 
 
 # ---------- CLIENTES ---------- #
@@ -486,7 +482,6 @@ def clientes_list():
     hoy = date.today()
     ayer = hoy - timedelta(days=1)
     antier = hoy - timedelta(days=2)
-
     hoy_txt = hoy.isoformat()
     ayer_txt = ayer.isoformat()
     antier_txt = antier.isoformat()
@@ -495,16 +490,16 @@ def clientes_list():
     c = conn.cursor()
 
     db_execute(c, "SELECT id FROM productos WHERE codigo = 'POLLO_ENTERO'")
-    row_prod = db_fetchone(c)
+    row_prod = c.fetchone()
     producto_base_id = row_prod["id"] if row_prod else None
 
     db_execute(c, "SELECT id, nombre, referencia FROM clientes ORDER BY id")
-    clientes = db_fetchall(c)
+    clientes = c.fetchall()
     conn.close()
 
     rows_html = ""
     for cl in clientes:
-        ref = cl.get("referencia") or ""
+        ref = cl["referencia"] or ""
 
         if producto_base_id is not None:
             precio_hoy = obtener_precio(cl["id"], producto_base_id, hoy_txt, "normal")
@@ -574,13 +569,13 @@ def clientes_list():
 def clientes_crear(nombre: str = Form(...), referencia: str = Form("")):
     conn = get_conn()
     c = conn.cursor()
-    db_execute(c, "INSERT INTO clientes (nombre, referencia) VALUES (?, ?)", (nombre, referencia))
+    insert_and_get_id(c, "INSERT INTO clientes (nombre, referencia) VALUES (?, ?)", (nombre, referencia))
     conn.commit()
     conn.close()
     return RedirectResponse(url="/clientes", status_code=303)
 
 
-# ---------- PRECIOS ---------- #
+# ---------- PRECIOS DEL DÍA ---------- #
 
 @app.get("/precios", response_class=HTMLResponse)
 def precios_form():
@@ -594,13 +589,12 @@ def precios_form():
 
     filas = ""
     for p in productos:
-        may_men = p["codigo"] in ("POLLO_ENTERO", "POLLO_VIVO")
         filas += f"""
         <tr>
             <td>{p['nombre']}<br><small>{p['codigo']}</small></td>
             <td><input type="number" step="0.01" name="precio_normal_{p['id']}" /></td>
-            <td>{("<input type='number' step='0.01' name='precio_mayoreo_"+str(p["id"])+"' />" if may_men else "-")}</td>
-            <td>{("<input type='number' step='0.01' name='precio_menudeo_"+str(p["id"])+"' />" if may_men else "-")}</td>
+            <td>{"<input type='number' step='0.01' name='precio_mayoreo_"+str(p["id"])+"' />" if p['codigo'] in ('POLLO_ENTERO','POLLO_VIVO') else "-"}</td>
+            <td>{"<input type='number' step='0.01' name='precio_menudeo_"+str(p["id"])+"' />" if p['codigo'] in ('POLLO_ENTERO','POLLO_VIVO') else "-"}</td>
         </tr>
         """
 
@@ -657,7 +651,7 @@ async def precios_save(request: Request):
         if val_normal:
             try:
                 precio = float(val_normal)
-                db_execute(c, """
+                insert_and_get_id(c, """
                     INSERT INTO precios (cliente_id, producto_id, fecha, tipo_venta, precio_por_kg)
                     VALUES (?, ?, ?, ?, ?)
                 """, (cliente_id, pid, fecha, "normal", precio))
@@ -669,7 +663,7 @@ async def precios_save(request: Request):
             if val_may:
                 try:
                     precio = float(val_may)
-                    db_execute(c, """
+                    insert_and_get_id(c, """
                         INSERT INTO precios (cliente_id, producto_id, fecha, tipo_venta, precio_por_kg)
                         VALUES (?, ?, ?, ?, ?)
                     """, (cliente_id, pid, fecha, "mayoreo", precio))
@@ -680,7 +674,7 @@ async def precios_save(request: Request):
             if val_men:
                 try:
                     precio = float(val_men)
-                    db_execute(c, """
+                    insert_and_get_id(c, """
                         INSERT INTO precios (cliente_id, producto_id, fecha, tipo_venta, precio_por_kg)
                         VALUES (?, ?, ?, ?, ?)
                     """, (cliente_id, pid, fecha, "menudeo", precio))
@@ -692,7 +686,7 @@ async def precios_save(request: Request):
     return RedirectResponse(url="/precios", status_code=303)
 
 
-# ---------- BOLETAS ---------- #
+# ---------- BOLETAS: CREAR / LISTAR ---------- #
 
 @app.get("/boletas/nueva", response_class=HTMLResponse)
 def boleta_form():
@@ -758,12 +752,10 @@ def boleta_crear(
 
     conn = get_conn()
     c = conn.cursor()
-    db_execute(c, """
-        INSERT INTO boletas_pesaje (
-            fecha_hora, cliente_id, producto_id, tipo_venta,
-            num_pollos, num_cajas, peso_total_kg,
-            comentarios, estado
-        )
+    insert_and_get_id(c, """
+        INSERT INTO boletas_pesaje (fecha_hora, cliente_id, producto_id, tipo_venta,
+                                   num_pollos, num_cajas, peso_total_kg,
+                                   comentarios, estado)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'abierta')
     """, (fecha_hora, cliente_id_val, producto_id, tipo_venta,
           num_pollos, num_cajas, peso_total_kg, comentarios))
@@ -785,7 +777,7 @@ def boletas_pendientes():
         WHERE b.estado = 'abierta'
         ORDER BY b.fecha_hora
     """)
-    boletas = db_fetchall(c)
+    boletas = c.fetchall()
     conn.close()
 
     rows = ""
@@ -854,12 +846,12 @@ def boletas_cobradas():
         ORDER BY v.fecha_hora DESC
         LIMIT 200
     """)
-    rows_db = db_fetchall(c)
+    rows_db = c.fetchall()
     conn.close()
 
     rows_html = ""
     for r in rows_db:
-        cliente = r["cliente"] if r.get("cliente") is not None else "OTRO / contado"
+        cliente = r["cliente"] if r["cliente"] is not None else "OTRO / contado"
         rows_html += f"""
         <tr>
             <td>{r['venta_id']}</td>
@@ -913,11 +905,11 @@ def cobrar_boleta_form(boleta_id: int):
         JOIN productos p ON p.id = b.producto_id
         WHERE b.id = ?
     """, (boleta_id,))
-    boleta = db_fetchone(c)
+    boleta = c.fetchone()
     conn.close()
 
     if not boleta:
-        return layout("Cobrar boleta", "<div class='card'>Boleta no encontrada.</div>")
+        return error_card("Boleta no encontrada.")
 
     body = f"""
     <h2>Cobrar boleta #{boleta_id}</h2>
@@ -955,15 +947,15 @@ def cobrar_boleta(
     c = conn.cursor()
 
     db_execute(c, "SELECT * FROM boletas_pesaje WHERE id = ?", (boleta_id,))
-    boleta = db_fetchone(c)
+    boleta = c.fetchone()
 
     if not boleta:
         conn.close()
-        return layout("Cobrar boleta", "<div class='card'>Boleta no encontrada.</div>")
+        return error_card("Boleta no encontrada.")
 
     if boleta["estado"] != "abierta":
         conn.close()
-        return layout("Cobrar boleta", "<div class='card'>La boleta ya fue cerrada.</div>")
+        return error_card("La boleta ya fue cerrada.")
 
     peso_total = float(boleta["peso_total_kg"])
     num_cajas = int(boleta["num_cajas"])
@@ -976,16 +968,16 @@ def cobrar_boleta(
     precio_por_kg = obtener_precio(cliente_id, producto_id, fecha_txt, tipo_venta)
     if precio_por_kg is None:
         conn.close()
-        return layout("Cobrar boleta", "<div class='card'>No hay precio configurado para ese día/cliente/tipo.</div>")
+        return error_card("No hay precio configurado para ese día/cliente/tipo.")
 
     peso_neto = peso_total - (num_cajas * float(peso_caja_kg))
     if peso_neto <= 0:
         conn.close()
-        return layout("Cobrar boleta", "<div class='card'>Error: peso neto resultó menor o igual a 0. Revisa los datos.</div>")
+        return error_card("Peso neto menor o igual a 0. Revisa datos.")
 
     total = round(peso_neto * float(precio_por_kg), 2)
 
-    venta_id = db_insert_returning_id(c, """
+    venta_id = insert_and_get_id(c, """
         INSERT INTO ventas (fecha_hora, boleta_id, cliente_id, producto_id,
                             peso_neto_kg, precio_por_kg, total, metodo_pago)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?)
@@ -995,7 +987,7 @@ def cobrar_boleta(
     db_execute(c, "UPDATE boletas_pesaje SET estado = 'cerrada' WHERE id = ?", (boleta_id,))
 
     if cliente_id is not None and metodo_pago == "credito_cliente":
-        db_execute(c, """
+        insert_and_get_id(c, """
             INSERT INTO movimientos_cliente (fecha_hora, cliente_id, tipo, referencia_id, monto)
             VALUES (?, ?, 'venta', ?, ?)
         """, (fecha_hora, cliente_id, venta_id, total))
@@ -1010,8 +1002,8 @@ def cobrar_boleta(
         <p><strong>Precio por kg:</strong> ${precio_por_kg:.2f}</p>
         <p><strong>Total:</strong> ${total:.2f}</p>
         <p><strong>Método de pago:</strong> {metodo_pago}</p>
-        <a class="btn btn-secondary" href="/boletas/pendientes">Volver a boletas pendientes</a>
-        <a class="btn btn-secondary" href="/boletas/cobradas">Ver boletas cobradas</a>
+        <a class="btn btn-secondary" href="/boletas/pendientes">Volver a pendientes</a>
+        <a class="btn btn-secondary" href="/boletas/cobradas">Ver cobradas</a>
     </div>
     """
     return layout("Venta generada", body)
@@ -1051,25 +1043,24 @@ def devolucion_crear(
     c = conn.cursor()
 
     db_execute(c, "SELECT * FROM ventas WHERE id = ?", (venta_id,))
-    venta = db_fetchone(c)
-
+    venta = c.fetchone()
     if not venta:
         conn.close()
-        return layout("Devolución", "<div class='card'>Venta no encontrada.</div>")
+        return error_card("Venta no encontrada.")
 
     cliente_id = venta["cliente_id"]
     precio_por_kg = float(venta["precio_por_kg"])
     monto_devuelto = round(float(peso_devuelto_kg) * precio_por_kg, 2)
     fecha_hora = datetime.now().isoformat(timespec="seconds")
 
-    devolucion_id = db_insert_returning_id(c, """
+    devolucion_id = insert_and_get_id(c, """
         INSERT INTO devoluciones (fecha_hora, venta_id, cliente_id,
                                   peso_devuelto_kg, monto_devuelto, motivo)
         VALUES (?, ?, ?, ?, ?, ?)
     """, (fecha_hora, venta_id, cliente_id, peso_devuelto_kg, monto_devuelto, motivo))
 
     if cliente_id is not None:
-        db_execute(c, """
+        insert_and_get_id(c, """
             INSERT INTO movimientos_cliente (fecha_hora, cliente_id, tipo, referencia_id, monto)
             VALUES (?, ?, 'devolucion', ?, ?)
         """, (fecha_hora, cliente_id, devolucion_id, -monto_devuelto))
@@ -1094,9 +1085,7 @@ def devolucion_crear(
 @app.get("/clientes/saldos", response_class=HTMLResponse)
 def saldo_selector():
     clientes = get_clientes()
-    opciones = ""
-    for cl in clientes:
-        opciones += f"<option value='{cl['id']}'>{cl['nombre']}</option>"
+    opciones = "".join([f"<option value='{cl['id']}'>{cl['nombre']}</option>" for cl in clientes])
 
     body = f"""
     <h2>Saldos de clientes</h2>
@@ -1117,10 +1106,10 @@ def saldo_cliente(cliente_id: int):
     c = conn.cursor()
 
     db_execute(c, "SELECT nombre FROM clientes WHERE id = ?", (cliente_id,))
-    row = db_fetchone(c)
+    row = c.fetchone()
     if not row:
         conn.close()
-        return layout("Saldo cliente", "<div class='card'>Cliente no encontrado.</div>")
+        return error_card("Cliente no encontrado.")
 
     nombre = row["nombre"]
 
@@ -1130,7 +1119,7 @@ def saldo_cliente(cliente_id: int):
         WHERE cliente_id = ?
         ORDER BY fecha_hora
     """, (cliente_id,))
-    movs = db_fetchall(c)
+    movs = c.fetchall()
     conn.close()
 
     saldo = 0.0
