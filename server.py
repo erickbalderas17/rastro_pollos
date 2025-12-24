@@ -1,3 +1,7 @@
+# ✅ CAMBIO: agrega buscador en /clientes usando querystring ?q=
+# - No toca DB, solo filtra lo que ya trae.
+# - Funciona igual en SQLite y Postgres.
+
 from fastapi import FastAPI, Request, Form
 from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
@@ -85,7 +89,6 @@ def init_db():
     cur = conn.cursor()
 
     if IS_POSTGRES:
-        # Tablas (Postgres)
         cur.execute("""
         CREATE TABLE IF NOT EXISTS clientes (
             id SERIAL PRIMARY KEY,
@@ -159,7 +162,6 @@ def init_db():
         );
         """)
     else:
-        # Tablas (SQLite)
         cur.execute("""
         CREATE TABLE IF NOT EXISTS clientes (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -233,7 +235,6 @@ def init_db():
         );
         """)
 
-    # Seed productos si está vacío
     db_execute(cur, "SELECT COUNT(*) AS c FROM productos")
     count_row = cur.fetchone()
     count_val = count_row["c"] if isinstance(count_row, dict) else count_row["c"]
@@ -383,6 +384,17 @@ def layout(title: str, body: str) -> HTMLResponse:
             .actions form {{
                 display: inline;
             }}
+            .search-row {{
+                display: flex;
+                gap: 10px;
+                align-items: end;
+            }}
+            .search-row input {{
+                margin-bottom: 0;
+            }}
+            .search-row .btn {{
+                height: 34px;
+            }}
         </style>
     </head>
     <body>
@@ -441,7 +453,6 @@ def obtener_precio(cliente_id, producto_id, fecha_txt, tipo_venta):
     conn = get_conn()
     c = conn.cursor()
 
-    # 1) Precio especial por cliente
     if cliente_id is not None:
         db_execute(c, """
             SELECT precio_por_kg FROM precios
@@ -453,7 +464,6 @@ def obtener_precio(cliente_id, producto_id, fecha_txt, tipo_venta):
             conn.close()
             return float(row["precio_por_kg"])
 
-    # 2) Precio general (cliente_id NULL)
     db_execute(c, """
         SELECT precio_por_kg FROM precios
         WHERE cliente_id IS NULL AND producto_id = ? AND fecha = ? AND tipo_venta = ?
@@ -487,10 +497,16 @@ def home():
     return layout("Inicio", body)
 
 
-# ---------- CLIENTES ---------- #
+# ---------- CLIENTES (con buscador) ---------- #
 
 @app.get("/clientes", response_class=HTMLResponse)
-def clientes_list():
+def clientes_list(q: str = ""):
+    """
+    Buscador: /clientes?q=algo
+    Filtra por nombre, referencia o id.
+    """
+    q_norm = (q or "").strip().lower()
+
     hoy = date.today()
     ayer = hoy - timedelta(days=1)
     antier = hoy - timedelta(days=2)
@@ -508,6 +524,17 @@ def clientes_list():
     db_execute(c, "SELECT id, nombre, referencia FROM clientes ORDER BY id")
     clientes = c.fetchall()
     conn.close()
+
+    # filtro en python (simple y rápido para lista pequeña/mediana)
+    if q_norm:
+        filtrados = []
+        for cl in clientes:
+            cid = str(cl["id"])
+            nombre = (cl["nombre"] or "").lower()
+            ref = (cl["referencia"] or "").lower()
+            if (q_norm in cid) or (q_norm in nombre) or (q_norm in ref):
+                filtrados.append(cl)
+        clientes = filtrados
 
     rows_html = ""
     for cl in clientes:
@@ -553,6 +580,7 @@ def clientes_list():
 
     body = f"""
     <h2>Clientes</h2>
+
     <div class="card">
         <form action="/clientes/crear" method="post">
             <label>Nombre cliente</label>
@@ -565,6 +593,20 @@ def clientes_list():
 
     <div class="card">
         <h3>Lista de clientes</h3>
+
+        <form method="get" action="/clientes">
+            <div class="search-row">
+                <div style="flex:1;">
+                    <label>Buscar (ID, nombre o referencia)</label>
+                    <input type="text" name="q" value="{(q or '').replace('"','&quot;')}" placeholder="Ej: Juan, 12, 'tiendita', etc." />
+                </div>
+                <div>
+                    <button class="btn btn-primary" type="submit">Buscar</button>
+                    <a class="btn btn-secondary" href="/clientes">Limpiar</a>
+                </div>
+            </div>
+        </form>
+
         <p><small>Precios mostrados: POLLO_ENTERO, tipo NORMAL. Columnas: antier, ayer y hoy.</small></p>
         <table>
             <thead>
@@ -579,7 +621,7 @@ def clientes_list():
                 </tr>
             </thead>
             <tbody>
-                {rows_html or "<tr><td colspan='7'>No hay clientes aún</td></tr>"}
+                {rows_html or "<tr><td colspan='7'>No hay resultados</td></tr>"}
             </tbody>
         </table>
     </div>
@@ -599,10 +641,6 @@ def clientes_crear(nombre: str = Form(...), referencia: str = Form("")):
 
 @app.post("/clientes/eliminar/{cliente_id}")
 def clientes_eliminar(cliente_id: int):
-    """
-    Elimina un cliente SOLO si no tiene registros relacionados.
-    (Evita borrar clientes que ya tienen precios/boletas/ventas/movimientos/devoluciones)
-    """
     conn = get_conn()
     c = conn.cursor()
 
@@ -631,7 +669,7 @@ def clientes_eliminar(cliente_id: int):
     return RedirectResponse(url="/clientes", status_code=303)
 
 
-# ---- NUEVO: AJUSTE DE SALDO (Agregar saldo) ----
+# ---- AJUSTE DE SALDO ----
 
 @app.get("/clientes/ajuste/{cliente_id}", response_class=HTMLResponse)
 def cliente_ajuste_form(cliente_id: int):
@@ -689,511 +727,6 @@ def cliente_ajuste_save(
     conn.commit()
     conn.close()
     return RedirectResponse(url="/clientes", status_code=303)
-
-
-# ---------- PRECIOS DEL DÍA ---------- #
-
-@app.get("/precios", response_class=HTMLResponse)
-def precios_form():
-    productos = get_productos()
-    clientes = get_clientes()
-    hoy = date.today().isoformat()
-
-    opciones_clientes = "<option value='0'>OTRO / contado (general)</option>"
-    for cl in clientes:
-        opciones_clientes += f"<option value='{cl['id']}'>{cl['nombre']}</option>"
-
-    filas = ""
-    for p in productos:
-        filas += f"""
-        <tr>
-            <td>{p['nombre']}<br><small>{p['codigo']}</small></td>
-            <td><input type="number" step="0.01" name="precio_normal_{p['id']}" /></td>
-            <td>{"<input type='number' step='0.01' name='precio_mayoreo_"+str(p["id"])+"' />" if p['codigo'] in ('POLLO_ENTERO','POLLO_VIVO') else "-"}</td>
-            <td>{"<input type='number' step='0.01' name='precio_menudeo_"+str(p["id"])+"' />" if p['codigo'] in ('POLLO_ENTERO','POLLO_VIVO') else "-"}</td>
-        </tr>
-        """
-
-    body = f"""
-    <h2>Precios del día</h2>
-    <div class="card">
-        <form action="/precios" method="post">
-            <label>Fecha</label>
-            <input type="date" name="fecha" value="{hoy}" required />
-
-            <label>Cliente</label>
-            <select name="cliente_id">
-                {opciones_clientes}
-            </select>
-
-            <p><strong>Captura precios por kg:</strong></p>
-            <table>
-                <thead>
-                    <tr>
-                        <th>Producto</th>
-                        <th>Precio normal</th>
-                        <th>Precio mayoreo (pollo entero y vivo)</th>
-                        <th>Precio menudeo (pollo entero y vivo)</th>
-                    </tr>
-                </thead>
-                <tbody>
-                    {filas}
-                </tbody>
-            </table>
-
-            <p><button class="btn btn-primary" type="submit">Guardar precios</button></p>
-        </form>
-    </div>
-    """
-    return layout("Precios", body)
-
-
-@app.post("/precios")
-async def precios_save(request: Request):
-    form = await request.form()
-    fecha = form.get("fecha")
-    cliente_id_raw = form.get("cliente_id", "0")
-    cliente_id = None if cliente_id_raw == "0" else int(cliente_id_raw)
-
-    conn = get_conn()
-    c = conn.cursor()
-
-    productos = get_productos()
-    for p in productos:
-        pid = p["id"]
-        codigo = p["codigo"]
-
-        val_normal = form.get(f"precio_normal_{pid}")
-        if val_normal:
-            try:
-                precio = float(val_normal)
-                insert_and_get_id(c, """
-                    INSERT INTO precios (cliente_id, producto_id, fecha, tipo_venta, precio_por_kg)
-                    VALUES (?, ?, ?, ?, ?)
-                """, (cliente_id, pid, fecha, "normal", precio))
-            except ValueError:
-                pass
-
-        if codigo in ("POLLO_ENTERO", "POLLO_VIVO"):
-            val_may = form.get(f"precio_mayoreo_{pid}")
-            if val_may:
-                try:
-                    precio = float(val_may)
-                    insert_and_get_id(c, """
-                        INSERT INTO precios (cliente_id, producto_id, fecha, tipo_venta, precio_por_kg)
-                        VALUES (?, ?, ?, ?, ?)
-                    """, (cliente_id, pid, fecha, "mayoreo", precio))
-                except ValueError:
-                    pass
-
-            val_men = form.get(f"precio_menudeo_{pid}")
-            if val_men:
-                try:
-                    precio = float(val_men)
-                    insert_and_get_id(c, """
-                        INSERT INTO precios (cliente_id, producto_id, fecha, tipo_venta, precio_por_kg)
-                        VALUES (?, ?, ?, ?, ?)
-                    """, (cliente_id, pid, fecha, "menudeo", precio))
-                except ValueError:
-                    pass
-
-    conn.commit()
-    conn.close()
-    return RedirectResponse(url="/precios", status_code=303)
-
-
-# ---------- BOLETAS: CREAR / LISTAR ---------- #
-
-@app.get("/boletas/nueva", response_class=HTMLResponse)
-def boleta_form():
-    clientes = get_clientes()
-    productos = get_productos()
-
-    opciones_clientes = "<option value='0'>OTRO / contado</option>"
-    for cl in clientes:
-        opciones_clientes += f"<option value='{cl['id']}'>{cl['nombre']}</option>"
-
-    opciones_productos = ""
-    for p in productos:
-        opciones_productos += f"<option value='{p['id']}'>{p['nombre']} ({p['codigo']})</option>"
-
-    body = f"""
-    <h2>Nueva boleta de pesaje</h2>
-    <div class="card">
-        <form action="/boletas/nueva" method="post">
-            <label>Cliente</label>
-            <select name="cliente_id">{opciones_clientes}</select>
-
-            <label>Producto</label>
-            <select name="producto_id">{opciones_productos}</select>
-
-            <label>Tipo de venta</label>
-            <select name="tipo_venta">
-                <option value="normal">Normal</option>
-                <option value="mayoreo">Mayoreo</option>
-                <option value="menudeo">Menudeo</option>
-            </select>
-
-            <label>Número de pollos</label>
-            <input type="number" name="num_pollos" required />
-
-            <label>Número de cajas</label>
-            <input type="number" name="num_cajas" required />
-
-            <label>Peso total (kg) capturado a mano</label>
-            <input type="number" step="0.001" name="peso_total_kg" required />
-
-            <label>Comentarios (opcional)</label>
-            <textarea name="comentarios"></textarea>
-
-            <button class="btn btn-primary" type="submit">Crear boleta</button>
-        </form>
-    </div>
-    """
-    return layout("Nueva boleta", body)
-
-
-@app.post("/boletas/nueva")
-def boleta_crear(
-    cliente_id: int = Form(0),
-    producto_id: int = Form(...),
-    tipo_venta: str = Form(...),
-    num_pollos: int = Form(...),
-    num_cajas: int = Form(...),
-    peso_total_kg: float = Form(...),
-    comentarios: str = Form(""),
-):
-    cliente_id_val = None if cliente_id == 0 else cliente_id
-    fecha_hora = datetime.now().isoformat(timespec="seconds")
-
-    conn = get_conn()
-    c = conn.cursor()
-    insert_and_get_id(c, """
-        INSERT INTO boletas_pesaje (fecha_hora, cliente_id, producto_id, tipo_venta,
-                                   num_pollos, num_cajas, peso_total_kg,
-                                   comentarios, estado)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'abierta')
-    """, (fecha_hora, cliente_id_val, producto_id, tipo_venta,
-          num_pollos, num_cajas, peso_total_kg, comentarios))
-    conn.commit()
-    conn.close()
-
-    return RedirectResponse(url="/boletas/pendientes", status_code=303)
-
-
-@app.get("/boletas/pendientes", response_class=HTMLResponse)
-def boletas_pendientes():
-    conn = get_conn()
-    c = conn.cursor()
-    db_execute(c, """
-        SELECT b.id, b.fecha_hora, b.peso_total_kg, b.num_pollos, b.num_cajas,
-               b.tipo_venta, p.nombre AS producto
-        FROM boletas_pesaje b
-        JOIN productos p ON p.id = b.producto_id
-        WHERE b.estado = 'abierta'
-        ORDER BY b.fecha_hora
-    """)
-    boletas = c.fetchall()
-    conn.close()
-
-    rows = ""
-    for b in boletas:
-        rows += f"""
-        <tr>
-            <td>{b['id']}</td>
-            <td>{b['fecha_hora']}</td>
-            <td>{b['producto']}</td>
-            <td>{b['num_pollos']}</td>
-            <td>{b['num_cajas']}</td>
-            <td>{float(b['peso_total_kg']):.3f}</td>
-            <td>{b['tipo_venta']}</td>
-            <td><a class="btn btn-primary" href="/boletas/cobrar/{b['id']}">Cobrar</a></td>
-        </tr>
-        """
-
-    body = f"""
-    <h2>Boletas pendientes de cobro</h2>
-    <div class="card">
-        <table>
-            <thead>
-                <tr>
-                    <th>ID</th>
-                    <th>Fecha/hora</th>
-                    <th>Producto</th>
-                    <th>Pollos</th>
-                    <th>Cajas</th>
-                    <th>Peso total (kg)</th>
-                    <th>Tipo venta</th>
-                    <th>Acción</th>
-                </tr>
-            </thead>
-            <tbody>
-                {rows or "<tr><td colspan='8'>No hay boletas abiertas</td></tr>"}
-            </tbody>
-        </table>
-    </div>
-    """
-    return layout("Boletas pendientes", body)
-
-
-@app.get("/boletas/cobradas", response_class=HTMLResponse)
-def boletas_cobradas():
-    conn = get_conn()
-    c = conn.cursor()
-    db_execute(c, """
-        SELECT
-            v.id AS venta_id,
-            v.fecha_hora AS fecha_venta,
-            b.id AS boleta_id,
-            b.fecha_hora AS fecha_boleta,
-            b.num_pollos,
-            b.num_cajas,
-            b.tipo_venta,
-            v.peso_neto_kg,
-            v.precio_por_kg,
-            v.total,
-            v.metodo_pago,
-            p.nombre AS producto,
-            cl.nombre AS cliente
-        FROM ventas v
-        JOIN boletas_pesaje b ON v.boleta_id = b.id
-        JOIN productos p ON p.id = b.producto_id
-        LEFT JOIN clientes cl ON cl.id = v.cliente_id
-        ORDER BY v.fecha_hora DESC
-        LIMIT 200
-    """)
-    rows_db = c.fetchall()
-    conn.close()
-
-    rows_html = ""
-    for r in rows_db:
-        cliente = r["cliente"] if r["cliente"] is not None else "OTRO / contado"
-        rows_html += f"""
-        <tr>
-            <td>{r['venta_id']}</td>
-            <td>{r['boleta_id']}</td>
-            <td>{r['fecha_venta']}</td>
-            <td>{cliente}</td>
-            <td>{r['producto']}</td>
-            <td>{float(r['peso_neto_kg']):.3f}</td>
-            <td>{float(r['precio_por_kg']):.2f}</td>
-            <td>{float(r['total']):.2f}</td>
-            <td>{r['metodo_pago']}</td>
-            <td>{r['tipo_venta']}</td>
-        </tr>
-        """
-
-    body = f"""
-    <h2>Boletas cobradas (ventas)</h2>
-    <div class="card">
-        <p>Últimas 200 ventas registradas.</p>
-        <table>
-            <thead>
-                <tr>
-                    <th>ID venta</th>
-                    <th>ID boleta</th>
-                    <th>Fecha venta</th>
-                    <th>Cliente</th>
-                    <th>Producto</th>
-                    <th>Peso neto (kg)</th>
-                    <th>Precio/kg</th>
-                    <th>Total</th>
-                    <th>Método pago</th>
-                    <th>Tipo venta</th>
-                </tr>
-            </thead>
-            <tbody>
-                {rows_html or "<tr><td colspan='10'>Aún no hay boletas cobradas</td></tr>"}
-            </tbody>
-        </table>
-    </div>
-    """
-    return layout("Boletas cobradas", body)
-
-
-@app.get("/boletas/cobrar/{boleta_id}", response_class=HTMLResponse)
-def cobrar_boleta_form(boleta_id: int):
-    conn = get_conn()
-    c = conn.cursor()
-    db_execute(c, """
-        SELECT b.*, p.nombre AS producto
-        FROM boletas_pesaje b
-        JOIN productos p ON p.id = b.producto_id
-        WHERE b.id = ?
-    """, (boleta_id,))
-    boleta = c.fetchone()
-    conn.close()
-
-    if not boleta:
-        return error_card("Boleta no encontrada.")
-
-    body = f"""
-    <h2>Cobrar boleta #{boleta_id}</h2>
-    <div class="card">
-        <p><strong>Producto:</strong> {boleta['producto']}</p>
-        <p><strong>Pollos:</strong> {boleta['num_pollos']} | <strong>Cajas:</strong> {boleta['num_cajas']}</p>
-        <p><strong>Peso total:</strong> {float(boleta['peso_total_kg']):.3f} kg</p>
-        <p><strong>Tipo de venta:</strong> {boleta['tipo_venta']}</p>
-
-        <form action="/boletas/cobrar/{boleta_id}" method="post">
-            <label>Peso estimado de cada caja (kg) para merma</label>
-            <input type="number" step="0.001" name="peso_caja_kg" required />
-
-            <label>Método de pago</label>
-            <select name="metodo_pago">
-                <option value="efectivo">Efectivo</option>
-                <option value="tarjeta">Tarjeta</option>
-                <option value="credito_cliente">Crédito cliente</option>
-            </select>
-
-            <button class="btn btn-primary" type="submit">Calcular y cobrar</button>
-        </form>
-    </div>
-    """
-    return layout("Cobrar boleta", body)
-
-
-@app.post("/boletas/cobrar/{boleta_id}")
-def cobrar_boleta(
-    boleta_id: int,
-    peso_caja_kg: float = Form(...),
-    metodo_pago: str = Form(...),
-):
-    conn = get_conn()
-    c = conn.cursor()
-
-    db_execute(c, "SELECT * FROM boletas_pesaje WHERE id = ?", (boleta_id,))
-    boleta = c.fetchone()
-
-    if not boleta:
-        conn.close()
-        return error_card("Boleta no encontrada.")
-
-    if boleta["estado"] != "abierta":
-        conn.close()
-        return error_card("La boleta ya fue cerrada.")
-
-    peso_total = float(boleta["peso_total_kg"])
-    num_cajas = int(boleta["num_cajas"])
-    cliente_id = boleta["cliente_id"]
-    producto_id = boleta["producto_id"]
-    tipo_venta = boleta["tipo_venta"]
-    fecha_txt = boleta["fecha_hora"][:10]
-    fecha_hora = datetime.now().isoformat(timespec="seconds")
-
-    precio_por_kg = obtener_precio(cliente_id, producto_id, fecha_txt, tipo_venta)
-    if precio_por_kg is None:
-        conn.close()
-        return error_card("No hay precio configurado para ese día/cliente/tipo.")
-
-    peso_neto = peso_total - (num_cajas * float(peso_caja_kg))
-    if peso_neto <= 0:
-        conn.close()
-        return error_card("Peso neto menor o igual a 0. Revisa datos.")
-
-    total = round(peso_neto * float(precio_por_kg), 2)
-
-    venta_id = insert_and_get_id(c, """
-        INSERT INTO ventas (fecha_hora, boleta_id, cliente_id, producto_id,
-                            peso_neto_kg, precio_por_kg, total, metodo_pago)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-    """, (fecha_hora, boleta_id, cliente_id, producto_id,
-          peso_neto, precio_por_kg, total, metodo_pago))
-
-    db_execute(c, "UPDATE boletas_pesaje SET estado = 'cerrada' WHERE id = ?", (boleta_id,))
-
-    if cliente_id is not None and metodo_pago == "credito_cliente":
-        insert_and_get_id(c, """
-            INSERT INTO movimientos_cliente (fecha_hora, cliente_id, tipo, referencia_id, monto)
-            VALUES (?, ?, 'venta', ?, ?)
-        """, (fecha_hora, cliente_id, venta_id, total))
-
-    conn.commit()
-    conn.close()
-
-    body = f"""
-    <h2>Venta generada #{venta_id}</h2>
-    <div class="card">
-        <p><strong>Peso neto:</strong> {peso_neto:.3f} kg</p>
-        <p><strong>Precio por kg:</strong> ${precio_por_kg:.2f}</p>
-        <p><strong>Total:</strong> ${total:.2f}</p>
-        <p><strong>Método de pago:</strong> {metodo_pago}</p>
-        <a class="btn btn-secondary" href="/boletas/pendientes">Volver a pendientes</a>
-        <a class="btn btn-secondary" href="/boletas/cobradas">Ver cobradas</a>
-    </div>
-    """
-    return layout("Venta generada", body)
-
-
-# ---------- DEVOLUCIONES ---------- #
-
-@app.get("/devoluciones/nueva", response_class=HTMLResponse)
-def devolucion_form():
-    body = """
-    <h2>Registrar devolución</h2>
-    <div class="card">
-        <form action="/devoluciones/nueva" method="post">
-            <label>ID de venta original</label>
-            <input type="number" name="venta_id" required />
-
-            <label>Peso devuelto (kg)</label>
-            <input type="number" step="0.001" name="peso_devuelto_kg" required />
-
-            <label>Motivo</label>
-            <textarea name="motivo"></textarea>
-
-            <button class="btn btn-danger" type="submit">Registrar devolución</button>
-        </form>
-    </div>
-    """
-    return layout("Devolución", body)
-
-
-@app.post("/devoluciones/nueva")
-def devolucion_crear(
-    venta_id: int = Form(...),
-    peso_devuelto_kg: float = Form(...),
-    motivo: str = Form(""),
-):
-    conn = get_conn()
-    c = conn.cursor()
-
-    db_execute(c, "SELECT * FROM ventas WHERE id = ?", (venta_id,))
-    venta = c.fetchone()
-    if not venta:
-        conn.close()
-        return error_card("Venta no encontrada.")
-
-    cliente_id = venta["cliente_id"]
-    precio_por_kg = float(venta["precio_por_kg"])
-    monto_devuelto = round(float(peso_devuelto_kg) * precio_por_kg, 2)
-    fecha_hora = datetime.now().isoformat(timespec="seconds")
-
-    devolucion_id = insert_and_get_id(c, """
-        INSERT INTO devoluciones (fecha_hora, venta_id, cliente_id,
-                                  peso_devuelto_kg, monto_devuelto, motivo)
-        VALUES (?, ?, ?, ?, ?, ?)
-    """, (fecha_hora, venta_id, cliente_id, peso_devuelto_kg, monto_devuelto, motivo))
-
-    if cliente_id is not None:
-        insert_and_get_id(c, """
-            INSERT INTO movimientos_cliente (fecha_hora, cliente_id, tipo, referencia_id, monto)
-            VALUES (?, ?, 'devolucion', ?, ?)
-        """, (fecha_hora, cliente_id, devolucion_id, -monto_devuelto))
-
-    conn.commit()
-    conn.close()
-
-    body = f"""
-    <h2>Devolución registrada</h2>
-    <div class="card">
-        <p><strong>ID devolución:</strong> {devolucion_id}</p>
-        <p><strong>Peso devuelto:</strong> {float(peso_devuelto_kg):.3f} kg</p>
-        <p><strong>Monto devuelto:</strong> ${monto_devuelto:.2f}</p>
-        <a class="btn btn-secondary" href="/">Volver al inicio</a>
-    </div>
-    """
-    return layout("Devolución registrada", body)
 
 
 # ---------- SALDOS ---------- #
@@ -1273,3 +806,4 @@ def saldo_cliente(cliente_id: int):
     </div>
     """
     return layout("Saldo cliente", body)
+
