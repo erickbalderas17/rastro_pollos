@@ -1,2 +1,3 @@
-.venv/
+rastro.db
 __pycache__/
+.venv/
