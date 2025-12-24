@@ -501,12 +501,6 @@ def home():
 
 @app.get("/clientes", response_class=HTMLResponse)
 def clientes_list(q: str = ""):
-    """
-    Buscador: /clientes?q=algo
-    Filtra por nombre, referencia o id.
-    """
-    q_norm = (q or "").strip().lower()
-
     hoy = date.today()
     ayer = hoy - timedelta(days=1)
     antier = hoy - timedelta(days=2)
@@ -521,112 +515,74 @@ def clientes_list(q: str = ""):
     row_prod = c.fetchone()
     producto_base_id = row_prod["id"] if row_prod else None
 
-    db_execute(c, "SELECT id, nombre, referencia FROM clientes ORDER BY id")
+    if q:
+        like = f"%{q}%"
+        db_execute(c,
+            "SELECT id, nombre, referencia FROM clientes "
+            "WHERE nombre ILIKE ? OR referencia ILIKE ? OR CAST(id AS TEXT) ILIKE ? "
+            "ORDER BY id",
+            (like, like, like)
+        )
+    else:
+        db_execute(c, "SELECT id, nombre, referencia FROM clientes ORDER BY id")
+
     clientes = c.fetchall()
     conn.close()
-
-    # filtro en python (simple y rápido para lista pequeña/mediana)
-    if q_norm:
-        filtrados = []
-        for cl in clientes:
-            cid = str(cl["id"])
-            nombre = (cl["nombre"] or "").lower()
-            ref = (cl["referencia"] or "").lower()
-            if (q_norm in cid) or (q_norm in nombre) or (q_norm in ref):
-                filtrados.append(cl)
-        clientes = filtrados
 
     rows_html = ""
     for cl in clientes:
         ref = cl["referencia"] or ""
 
-        if producto_base_id is not None:
+        if producto_base_id:
             precio_hoy = obtener_precio(cl["id"], producto_base_id, hoy_txt, "normal")
             precio_ayer = obtener_precio(cl["id"], producto_base_id, ayer_txt, "normal")
             precio_antier = obtener_precio(cl["id"], producto_base_id, antier_txt, "normal")
-
-            if precio_hoy is None:
-                precio_hoy = obtener_precio(None, producto_base_id, hoy_txt, "normal")
-            if precio_ayer is None:
-                precio_ayer = obtener_precio(None, producto_base_id, ayer_txt, "normal")
-            if precio_antier is None:
-                precio_antier = obtener_precio(None, producto_base_id, antier_txt, "normal")
         else:
             precio_hoy = precio_ayer = precio_antier = None
 
-        texto_antier = f"${precio_antier:.2f}" if precio_antier is not None else "-"
-        texto_ayer = f"${precio_ayer:.2f}" if precio_ayer is not None else "-"
-        texto_hoy = f"${precio_hoy:.2f}" if precio_hoy is not None else "-"
-
-        rows_html += (
-            f"<tr>"
-            f"<td>{cl['id']}</td>"
-            f"<td>{cl['nombre']}</td>"
-            f"<td>{ref}</td>"
-            f"<td>{texto_antier}</td>"
-            f"<td>{texto_ayer}</td>"
-            f"<td>{texto_hoy}</td>"
-            f"<td class='actions'>"
-            f"  <a class='btn btn-secondary' href='/clientes/ajuste/{cl['id']}'>Agregar saldo</a>"
-            f"  <form method='post' action='/clientes/eliminar/{cl['id']}' style='display:inline;'>"
-            f"    <button class='btn btn-danger' type='submit' "
-            f"      onclick=\"return confirm('¿Seguro que quieres borrar este cliente?')\">"
-            f"      Borrar"
-            f"    </button>"
-            f"  </form>"
-            f"</td>"
-            f"</tr>"
-        )
+        rows_html += f"""
+        <tr>
+            <td>{cl['id']}</td>
+            <td>{cl['nombre']}</td>
+            <td>{ref}</td>
+            <td>{precio_antier or '-'}</td>
+            <td>{precio_ayer or '-'}</td>
+            <td>{precio_hoy or '-'}</td>
+            <td>
+                <a class="btn btn-secondary" href="/clientes/ajuste/{cl['id']}">Agregar saldo</a>
+                <form method="post" action="/clientes/eliminar/{cl['id']}" style="display:inline;">
+                    <button class="btn btn-danger"
+                        onclick="return confirm('¿Seguro que quieres borrar este cliente?')">
+                        Borrar
+                    </button>
+                </form>
+            </td>
+        </tr>
+        """
 
     body = f"""
     <h2>Clientes</h2>
 
-    <div class="card">
-        <form action="/clientes/crear" method="post">
-            <label>Nombre cliente</label>
-            <input type="text" name="nombre" required />
-            <label>Referencia (opcional)</label>
-            <input type="text" name="referencia" />
-            <button class="btn btn-primary" type="submit">Crear cliente</button>
-        </form>
-    </div>
+    <form method="get">
+        <input name="q" value="{q}" placeholder="Buscar por nombre, referencia o id">
+        <button class="btn btn-primary">Buscar</button>
+        <a class="btn btn-secondary" href="/clientes">Limpiar</a>
+    </form>
 
-    <div class="card">
-        <h3>Lista de clientes</h3>
-
-        <form method="get" action="/clientes">
-            <div class="search-row">
-                <div style="flex:1;">
-                    <label>Buscar (ID, nombre o referencia)</label>
-                    <input type="text" name="q" value="{(q or '').replace('"','&quot;')}" placeholder="Ej: Juan, 12, 'tiendita', etc." />
-                </div>
-                <div>
-                    <button class="btn btn-primary" type="submit">Buscar</button>
-                    <a class="btn btn-secondary" href="/clientes">Limpiar</a>
-                </div>
-            </div>
-        </form>
-
-        <p><small>Precios mostrados: POLLO_ENTERO, tipo NORMAL. Columnas: antier, ayer y hoy.</small></p>
-        <table>
-            <thead>
-                <tr>
-                    <th>ID</th>
-                    <th>Nombre</th>
-                    <th>Referencia</th>
-                    <th>Precio antier ({antier_txt})</th>
-                    <th>Precio ayer ({ayer_txt})</th>
-                    <th>Precio hoy ({hoy_txt})</th>
-                    <th>Acciones</th>
-                </tr>
-            </thead>
-            <tbody>
-                {rows_html or "<tr><td colspan='7'>No hay resultados</td></tr>"}
-            </tbody>
-        </table>
-    </div>
+    <table>
+        <thead>
+            <tr>
+                <th>ID</th><th>Nombre</th><th>Referencia</th>
+                <th>Antier</th><th>Ayer</th><th>Hoy</th><th>Acciones</th>
+            </tr>
+        </thead>
+        <tbody>
+            {rows_html or "<tr><td colspan='7'>Sin clientes</td></tr>"}
+        </tbody>
+    </table>
     """
     return layout("Clientes", body)
+
 
 
 @app.post("/clientes/crear")
