@@ -1,3 +1,4 @@
+# server.py
 from fastapi import FastAPI, Request, Form
 from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
@@ -31,8 +32,8 @@ STATIC_DIR = os.path.join(BASE_DIR, "static")
 os.makedirs(STATIC_DIR, exist_ok=True)
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
-# ---------------- DB HELPERS ----------------
 
+# ---------------- DB HELPERS ----------------
 
 def get_conn():
     pg_host = os.getenv("PGHOST")
@@ -263,7 +264,6 @@ def _startup():
 
 # ---------- LAYOUT / HTML ---------- #
 
-
 def layout(title: str, body: str) -> HTMLResponse:
     html = f"""
     <html>
@@ -418,32 +418,76 @@ def error_card(msg: str) -> HTMLResponse:
     return layout("Error", f"<div class='card error'><b>Error:</b> {msg}</div>")
 
 
-# ---------- UTILIDADES ---------- #
+# ---------- UTILIDADES (con cache simple en memoria) ---------- #
+
+# Cache muy simple para reducir roundtrips (suficiente para una app chica).
+# Nota: en Railway puede haber múltiples workers/procesos, el cache es por proceso.
+_CACHE = {
+    "productos": {"ts": 0.0, "data": None},
+    "clientes": {"ts": 0.0, "data": None},
+}
+_CACHE_TTL_SECONDS = 10.0
+
+
+def _now_ts() -> float:
+    return datetime.now().timestamp()
+
+
+def cache_get(key: str):
+    item = _CACHE.get(key)
+    if not item:
+        return None
+    if item["data"] is None:
+        return None
+    if (_now_ts() - float(item["ts"])) > _CACHE_TTL_SECONDS:
+        return None
+    return item["data"]
+
+
+def cache_set(key: str, data):
+    _CACHE[key] = {"ts": _now_ts(), "data": data}
+
+
+def cache_bust(*keys: str):
+    for k in keys:
+        if k in _CACHE:
+            _CACHE[k] = {"ts": 0.0, "data": None}
 
 
 def get_productos():
+    cached = cache_get("productos")
+    if cached is not None:
+        return cached
     conn = get_conn()
     c = conn.cursor()
     db_execute(c, "SELECT id, nombre, codigo FROM productos ORDER BY id")
     productos = c.fetchall()
     conn.close()
+    cache_set("productos", productos)
     return productos
 
 
 def get_clientes():
+    cached = cache_get("clientes")
+    if cached is not None:
+        return cached
     conn = get_conn()
     c = conn.cursor()
     db_execute(c, "SELECT id, nombre FROM clientes ORDER BY nombre")
     clientes = c.fetchall()
     conn.close()
+    cache_set("clientes", clientes)
     return clientes
 
 
 def obtener_precio(cliente_id, producto_id, fecha_txt, tipo_venta):
+    """
+    Se mantiene para otras pantallas (1 boleta = 1 consulta aquí es ok),
+    pero para /clientes ya NO se usa (allí hacemos batch).
+    """
     conn = get_conn()
     c = conn.cursor()
 
-    # 1) Precio especial por cliente
     if cliente_id is not None:
         db_execute(c, """
             SELECT precio_por_kg FROM precios
@@ -455,7 +499,6 @@ def obtener_precio(cliente_id, producto_id, fecha_txt, tipo_venta):
             conn.close()
             return float(row["precio_por_kg"])
 
-    # 2) Precio general (cliente_id NULL)
     db_execute(c, """
         SELECT precio_por_kg FROM precios
         WHERE cliente_id IS NULL AND producto_id = ? AND fecha = ? AND tipo_venta = ?
@@ -468,8 +511,40 @@ def obtener_precio(cliente_id, producto_id, fecha_txt, tipo_venta):
     return None
 
 
-# ---------- HOME ---------- #
+def obtener_precios_lote(producto_id: int, fechas: list[str], tipo_venta: str = "normal"):
+    """
+    Trae TODOS los precios de (producto_id, fechas, tipo_venta) en UNA sola consulta.
+    Regresa dict: {(cliente_id, fecha): precio_float}
+    cliente_id puede ser None (precio general).
+    """
+    if producto_id is None or not fechas:
+        return {}
 
+    conn = get_conn()
+    c = conn.cursor()
+
+    placeholders = ",".join(["?"] * len(fechas))
+    q = f"""
+        SELECT cliente_id, fecha, precio_por_kg
+        FROM precios
+        WHERE producto_id = ?
+          AND tipo_venta = ?
+          AND fecha IN ({placeholders})
+    """
+    params = [producto_id, tipo_venta] + list(fechas)
+    db_execute(c, q, params)
+    rows = c.fetchall()
+    conn.close()
+
+    out = {}
+    for r in rows:
+        cid = r["cliente_id"]  # puede venir None
+        f = r["fecha"]
+        out[(cid, f)] = float(r["precio_por_kg"])
+    return out
+
+
+# ---------- HOME ---------- #
 
 @app.get("/", response_class=HTMLResponse)
 def home():
@@ -490,8 +565,7 @@ def home():
     return layout("Inicio", body)
 
 
-# ---------- CLIENTES (Buscador + Agregar saldo + Borrar) ---------- #
-
+# ---------- CLIENTES (Buscador + batch precios) ---------- #
 
 @app.get("/clientes", response_class=HTMLResponse)
 def clientes_list(q: str = ""):
@@ -516,34 +590,44 @@ def clientes_list(q: str = ""):
             db_execute(c, "SELECT id, nombre, referencia FROM clientes WHERE id = ? ORDER BY id", (int(q),))
         else:
             like = f"%{q}%"
-            db_execute(
-                c,
-                "SELECT id, nombre, referencia FROM clientes WHERE nombre LIKE ? OR referencia LIKE ? ORDER BY id",
-                (like, like),
-            )
+            # OJO: en Postgres LIKE es case-sensitive; si quieres case-insensitive usa ILIKE.
+            if IS_POSTGRES:
+                db_execute(
+                    c,
+                    "SELECT id, nombre, referencia FROM clientes WHERE nombre ILIKE ? OR referencia ILIKE ? ORDER BY id",
+                    (like, like),
+                )
+            else:
+                db_execute(
+                    c,
+                    "SELECT id, nombre, referencia FROM clientes WHERE nombre LIKE ? OR referencia LIKE ? ORDER BY id",
+                    (like, like),
+                )
     else:
         db_execute(c, "SELECT id, nombre, referencia FROM clientes ORDER BY id")
 
     clientes = c.fetchall()
     conn.close()
 
+    # ---- OPTIMIZACIÓN CLAVE: batch de precios (1 query total) ----
+    fechas = [antier_txt, ayer_txt, hoy_txt]
+    precios_map = obtener_precios_lote(producto_base_id, fechas, tipo_venta="normal")
+
+    def get_precio(cid, ftxt):
+        # 1) precio especial
+        val = precios_map.get((cid, ftxt))
+        if val is not None:
+            return val
+        # 2) precio general
+        return precios_map.get((None, ftxt))
+
     rows_html = ""
     for cl in clientes:
         ref = cl["referencia"] or ""
 
-        if producto_base_id is not None:
-            precio_hoy = obtener_precio(cl["id"], producto_base_id, hoy_txt, "normal")
-            precio_ayer = obtener_precio(cl["id"], producto_base_id, ayer_txt, "normal")
-            precio_antier = obtener_precio(cl["id"], producto_base_id, antier_txt, "normal")
-
-            if precio_hoy is None:
-                precio_hoy = obtener_precio(None, producto_base_id, hoy_txt, "normal")
-            if precio_ayer is None:
-                precio_ayer = obtener_precio(None, producto_base_id, ayer_txt, "normal")
-            if precio_antier is None:
-                precio_antier = obtener_precio(None, producto_base_id, antier_txt, "normal")
-        else:
-            precio_hoy = precio_ayer = precio_antier = None
+        precio_antier = get_precio(cl["id"], antier_txt)
+        precio_ayer = get_precio(cl["id"], ayer_txt)
+        precio_hoy = get_precio(cl["id"], hoy_txt)
 
         texto_antier = f"${precio_antier:.2f}" if precio_antier is not None else "-"
         texto_ayer = f"${precio_ayer:.2f}" if precio_ayer is not None else "-"
@@ -619,14 +703,12 @@ def clientes_crear(nombre: str = Form(...), referencia: str = Form("")):
     insert_and_get_id(c, "INSERT INTO clientes (nombre, referencia) VALUES (?, ?)", (nombre, referencia))
     conn.commit()
     conn.close()
+    cache_bust("clientes")  # <- importante
     return RedirectResponse(url="/clientes", status_code=303)
 
 
 @app.post("/clientes/eliminar/{cliente_id}")
 def clientes_eliminar(cliente_id: int):
-    """
-    Elimina un cliente SOLO si no tiene registros relacionados.
-    """
     conn = get_conn()
     c = conn.cursor()
 
@@ -652,10 +734,11 @@ def clientes_eliminar(cliente_id: int):
     db_execute(c, "DELETE FROM clientes WHERE id = ?", (cliente_id,))
     conn.commit()
     conn.close()
+    cache_bust("clientes")
     return RedirectResponse(url="/clientes", status_code=303)
 
 
-# ---- AJUSTE DE SALDO (Agregar saldo) ----
+# ---- AJUSTE DE SALDO ----
 
 @app.get("/clientes/ajuste/{cliente_id}", response_class=HTMLResponse)
 def cliente_ajuste_form(cliente_id: int):
@@ -715,8 +798,7 @@ def cliente_ajuste_save(
     return RedirectResponse(url="/clientes", status_code=303)
 
 
-# ---------- PRECIOS DEL DÍA ---------- #
-
+# ---------- PRECIOS DEL DÍA ----------
 
 @app.get("/precios", response_class=HTMLResponse)
 def precios_form():
@@ -827,8 +909,7 @@ async def precios_save(request: Request):
     return RedirectResponse(url="/precios", status_code=303)
 
 
-# ---------- BOLETAS: CREAR / LISTAR ---------- #
-
+# ---------- BOLETAS ----------
 
 @app.get("/boletas/nueva", response_class=HTMLResponse)
 def boleta_form():
@@ -1151,8 +1232,7 @@ def cobrar_boleta(
     return layout("Venta generada", body)
 
 
-# ---------- DEVOLUCIONES ---------- #
-
+# ---------- DEVOLUCIONES ----------
 
 @app.get("/devoluciones/nueva", response_class=HTMLResponse)
 def devolucion_form():
@@ -1223,8 +1303,7 @@ def devolucion_crear(
     return layout("Devolución registrada", body)
 
 
-# ---------- SALDOS ---------- #
-
+# ---------- SALDOS ----------
 
 @app.get("/clientes/saldos", response_class=HTMLResponse)
 def saldo_selector():
