@@ -17,7 +17,7 @@ DB_PATH = os.path.join(BASE_DIR, "rastro.db")
 DATABASE_URL = os.getenv("DATABASE_URL")  # en Railway/Supabase
 APP_SECRET = os.getenv("APP_SECRET", "dev-secret")
 
-IS_POSTGRES = bool(DATABASE_URL)
+IS_POSTGRES = bool(os.getenv("PGHOST"))
 
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
@@ -35,16 +35,21 @@ app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 # ---------------- DB HELPERS ----------------
 
 def get_conn():
-    """
-    Si existe DATABASE_URL -> Postgres (Supabase/Railway)
-    Si NO existe -> SQLite local (rastro.db)
-    """
-    if IS_POSTGRES:
+    pg_host = os.getenv("PGHOST")
+
+    if pg_host:
         return psycopg2.connect(
-            DATABASE_URL,
-            sslmode="require",
+            host=pg_host,
+            port=int(os.getenv("PGPORT", "5432")),
+            dbname=os.getenv("PGDATABASE", "postgres"),
+            user=os.getenv("PGUSER"),
+            password=os.getenv("PGPASSWORD"),
+            sslmode=os.getenv("PGSSLMODE", "require"),
             cursor_factory=RealDictCursor,
+            connect_timeout=10,
         )
+
+    # fallback sqlite local
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     return conn
@@ -527,6 +532,14 @@ def clientes_list():
             f"<td>{texto_antier}</td>"
             f"<td>{texto_ayer}</td>"
             f"<td>{texto_hoy}</td>"
+            f"<td>"
+            f"  <form method='post' action='/clientes/eliminar/{cl['id']}' style='display:inline;'>"
+            f"    <button class='btn btn-danger' type='submit' "
+            f"      onclick=\"return confirm('¿Seguro que quieres borrar este cliente?')\">"
+            f"      Borrar"
+            f"    </button>"
+            f"  </form>"
+            f"</td>"
             f"</tr>"
         )
 
@@ -554,10 +567,11 @@ def clientes_list():
                     <th>Precio antier ({antier_txt})</th>
                     <th>Precio ayer ({ayer_txt})</th>
                     <th>Precio hoy ({hoy_txt})</th>
+                    <th>Acciones</th>
                 </tr>
             </thead>
             <tbody>
-                {rows_html or "<tr><td colspan='6'>No hay clientes aún</td></tr>"}
+                {rows_html or "<tr><td colspan='7'>No hay clientes aún</td></tr>"}
             </tbody>
         </table>
     </div>
@@ -570,6 +584,40 @@ def clientes_crear(nombre: str = Form(...), referencia: str = Form("")):
     conn = get_conn()
     c = conn.cursor()
     insert_and_get_id(c, "INSERT INTO clientes (nombre, referencia) VALUES (?, ?)", (nombre, referencia))
+    conn.commit()
+    conn.close()
+    return RedirectResponse(url="/clientes", status_code=303)
+
+
+@app.post("/clientes/eliminar/{cliente_id}")
+def clientes_eliminar(cliente_id: int):
+    """
+    Elimina un cliente SOLO si no tiene registros relacionados.
+    (Evita borrar clientes que ya tienen precios/boletas/ventas/movimientos/devoluciones)
+    """
+    conn = get_conn()
+    c = conn.cursor()
+
+    checks = [
+        ("precios", "SELECT COUNT(*) AS c FROM precios WHERE cliente_id = ?", (cliente_id,)),
+        ("boletas_pesaje", "SELECT COUNT(*) AS c FROM boletas_pesaje WHERE cliente_id = ?", (cliente_id,)),
+        ("ventas", "SELECT COUNT(*) AS c FROM ventas WHERE cliente_id = ?", (cliente_id,)),
+        ("movimientos_cliente", "SELECT COUNT(*) AS c FROM movimientos_cliente WHERE cliente_id = ?", (cliente_id,)),
+        ("devoluciones", "SELECT COUNT(*) AS c FROM devoluciones WHERE cliente_id = ?", (cliente_id,)),
+    ]
+
+    for tabla, q, params in checks:
+        db_execute(c, q, params)
+        row = c.fetchone()
+        cnt = row["c"] if row is not None else 0
+        if int(cnt) > 0:
+            conn.close()
+            return error_card(
+                f"No puedo borrar el cliente porque tiene {cnt} registro(s) en '{tabla}'. "
+                "Primero elimina/ajusta esos registros, o implementamos borrado en cascada."
+            )
+
+    db_execute(c, "DELETE FROM clientes WHERE id = ?", (cliente_id,))
     conn.commit()
     conn.close()
     return RedirectResponse(url="/clientes", status_code=303)
@@ -1157,3 +1205,4 @@ def saldo_cliente(cliente_id: int):
     </div>
     """
     return layout("Saldo cliente", body)
+
