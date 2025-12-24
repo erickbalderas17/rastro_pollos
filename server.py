@@ -14,7 +14,7 @@ from passlib.context import CryptContext
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DB_PATH = os.path.join(BASE_DIR, "rastro.db")
 
-DATABASE_URL = os.getenv("DATABASE_URL")  # en Railway/Supabase
+DATABASE_URL = os.getenv("DATABASE_URL")  # en Railway/Supabase (no se usa directo aquí)
 APP_SECRET = os.getenv("APP_SECRET", "dev-secret")
 
 IS_POSTGRES = bool(os.getenv("PGHOST"))
@@ -246,7 +246,8 @@ def init_db():
             ("Alitas", "ALITAS"),
         ]
         for nombre, codigo in productos_seed:
-            insert_and_get_id(cur,
+            insert_and_get_id(
+                cur,
                 "INSERT INTO productos (nombre, codigo) VALUES (?, ?)",
                 (nombre, codigo)
             )
@@ -375,6 +376,12 @@ def layout(title: str, body: str) -> HTMLResponse:
                 padding: 12px;
                 border-radius: 8px;
                 color: #991b1b;
+            }}
+            .actions {{
+                white-space: nowrap;
+            }}
+            .actions form {{
+                display: inline;
             }}
         </style>
     </head>
@@ -532,7 +539,8 @@ def clientes_list():
             f"<td>{texto_antier}</td>"
             f"<td>{texto_ayer}</td>"
             f"<td>{texto_hoy}</td>"
-            f"<td>"
+            f"<td class='actions'>"
+            f"  <a class='btn btn-secondary' href='/clientes/ajuste/{cl['id']}'>Agregar saldo</a>"
             f"  <form method='post' action='/clientes/eliminar/{cl['id']}' style='display:inline;'>"
             f"    <button class='btn btn-danger' type='submit' "
             f"      onclick=\"return confirm('¿Seguro que quieres borrar este cliente?')\">"
@@ -618,6 +626,66 @@ def clientes_eliminar(cliente_id: int):
             )
 
     db_execute(c, "DELETE FROM clientes WHERE id = ?", (cliente_id,))
+    conn.commit()
+    conn.close()
+    return RedirectResponse(url="/clientes", status_code=303)
+
+
+# ---- NUEVO: AJUSTE DE SALDO (Agregar saldo) ----
+
+@app.get("/clientes/ajuste/{cliente_id}", response_class=HTMLResponse)
+def cliente_ajuste_form(cliente_id: int):
+    conn = get_conn()
+    c = conn.cursor()
+    db_execute(c, "SELECT id, nombre FROM clientes WHERE id = ?", (cliente_id,))
+    cl = c.fetchone()
+    conn.close()
+
+    if not cl:
+        return error_card("Cliente no encontrado.")
+
+    body = f"""
+    <h2>Agregar saldo (ajuste) — {cl['nombre']}</h2>
+    <div class="card">
+        <p>
+            Usa <b>positivo</b> para saldo a favor (abono) y <b>negativo</b> para saldo en contra (cargo).
+        </p>
+        <form action="/clientes/ajuste/{cliente_id}" method="post">
+            <label>Monto del ajuste (puede ser negativo)</label>
+            <input type="number" step="0.01" name="monto" required />
+
+            <label>Referencia (opcional)</label>
+            <input type="number" name="referencia_id" value="0" />
+
+            <button class="btn btn-primary" type="submit">Guardar ajuste</button>
+            <a class="btn btn-secondary" href="/clientes">Cancelar</a>
+        </form>
+    </div>
+    """
+    return layout("Agregar saldo", body)
+
+
+@app.post("/clientes/ajuste/{cliente_id}")
+def cliente_ajuste_save(
+    cliente_id: int,
+    monto: float = Form(...),
+    referencia_id: int = Form(0),
+):
+    fecha_hora = datetime.now().isoformat(timespec="seconds")
+
+    conn = get_conn()
+    c = conn.cursor()
+
+    db_execute(c, "SELECT id FROM clientes WHERE id = ?", (cliente_id,))
+    if not c.fetchone():
+        conn.close()
+        return error_card("Cliente no encontrado.")
+
+    insert_and_get_id(c, """
+        INSERT INTO movimientos_cliente (fecha_hora, cliente_id, tipo, referencia_id, monto)
+        VALUES (?, ?, 'ajuste', ?, ?)
+    """, (fecha_hora, cliente_id, int(referencia_id), float(monto)))
+
     conn.commit()
     conn.close()
     return RedirectResponse(url="/clientes", status_code=303)
@@ -1205,4 +1273,3 @@ def saldo_cliente(cliente_id: int):
     </div>
     """
     return layout("Saldo cliente", body)
-
