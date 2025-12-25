@@ -2,52 +2,65 @@
 from fastapi import FastAPI, Request, Form
 from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
+from starlette.middleware.sessions import SessionMiddleware
+
 from datetime import datetime, date, timedelta
 import os, sqlite3
 from typing import Optional
-import hashlib, hmac
 
 import psycopg2
 from psycopg2.extras import RealDictCursor
 from psycopg2.pool import ThreadedConnectionPool
-from starlette.middleware.sessions import SessionMiddleware
+
 
 # ---------------- CONFIG ----------------
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DB_PATH = os.path.join(BASE_DIR, "rastro.db")
 
-APP_SECRET = os.getenv("APP_SECRET", "dev-secret")
-
+APP_SECRET = (os.getenv("APP_SECRET") or "").strip()
 IS_POSTGRES = bool(os.getenv("PGHOST"))
+IS_RAILWAY = bool(os.getenv("RAILWAY_ENVIRONMENT"))
+IS_PROD = IS_POSTGRES or IS_RAILWAY
 
-# Usuarios (Railway env vars)
-CAJA_PASSWORD = os.getenv("CAJA_PASSWORD", "caja123")
-BASCULA_PASSWORD = os.getenv("BASCULA_PASSWORD", "bascula123")
-
-def _hash_password(p: str) -> str:
-    return hashlib.sha256(p.encode("utf-8")).hexdigest()
-
-def verify_password(plain: str, stored_hash: str) -> bool:
-    return hmac.compare_digest(_hash_password(plain), stored_hash)
-
-# Puedes opcionalmente setear hashes directos en Railway:
-# CAJA_PASSWORD_HASH y BASCULA_PASSWORD_HASH
-CAJA_PASSWORD_HASH = os.getenv("CAJA_PASSWORD_HASH") or _hash_password(CAJA_PASSWORD)
-BASCULA_PASSWORD_HASH = os.getenv("BASCULA_PASSWORD_HASH") or _hash_password(BASCULA_PASSWORD)
-
-# Pool Postgres (más rápido que abrir/cerrar conexión en cada request)
+# Pool Postgres
 PG_POOL: Optional[ThreadedConnectionPool] = None
+
+
+def must_env(name: str) -> str:
+    """
+    En Railway/Prod: si falta, truena (para que NO caiga a defaults).
+    En local: permite default para que puedas probar.
+    """
+    val = os.getenv(name)
+    if val is None or str(val).strip() == "":
+        if IS_PROD:
+            raise RuntimeError(f"Falta variable de entorno requerida: {name}")
+        # defaults SOLO para local
+        if name == "APP_SECRET":
+            return "dev-secret"
+        if name == "CAJA_PASSWORD":
+            return "caja123"
+        if name == "BASCULA_PASSWORD":
+            return "bascula123"
+        return ""
+    return str(val).strip()
+
+
+APP_SECRET = must_env("APP_SECRET")
+CAJA_PASSWORD = must_env("CAJA_PASSWORD")
+BASCULA_PASSWORD = must_env("BASCULA_PASSWORD")
+
 
 # ---------------- APP ----------------
 
 app = FastAPI()
 app.add_middleware(SessionMiddleware, secret_key=APP_SECRET)
 
-# static
 STATIC_DIR = os.path.join(BASE_DIR, "static")
 os.makedirs(STATIC_DIR, exist_ok=True)
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
+
 
 # ---------------- DB HELPERS ----------------
 
@@ -70,6 +83,7 @@ def init_pg_pool():
         connect_timeout=10,
     )
 
+
 def get_conn():
     if IS_POSTGRES:
         if PG_POOL is None:
@@ -80,11 +94,13 @@ def get_conn():
     conn.row_factory = sqlite3.Row
     return conn
 
+
 def close_conn(conn):
+    if conn is None:
+        return
     if IS_POSTGRES:
         try:
-            if conn:
-                PG_POOL.putconn(conn)
+            PG_POOL.putconn(conn)
         except Exception:
             try:
                 conn.close()
@@ -96,23 +112,30 @@ def close_conn(conn):
         except Exception:
             pass
 
+
+def cursor(conn):
+    return conn.cursor(cursor_factory=RealDictCursor) if IS_POSTGRES else conn.cursor()
+
+
 def db_execute(cur, query: str, params=()):
     if IS_POSTGRES:
         query = query.replace("?", "%s")
     cur.execute(query, params)
+
 
 def insert_and_get_id(cur, query: str, params=()):
     if IS_POSTGRES:
         q = query.replace("?", "%s").rstrip().rstrip(";") + " RETURNING id"
         cur.execute(q, params)
         row = cur.fetchone()
-        return row["id"] if isinstance(row, dict) else row[0]
+        return row["id"]
     cur.execute(query, params)
     return cur.lastrowid
 
+
 def init_db():
     conn = get_conn()
-    cur = conn.cursor(cursor_factory=RealDictCursor) if IS_POSTGRES else conn.cursor()
+    cur = cursor(conn)
 
     if IS_POSTGRES:
         cur.execute("""
@@ -187,6 +210,12 @@ def init_db():
             motivo TEXT
         );
         """)
+
+        # Índices (performance)
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_boletas_estado_fecha ON boletas_pesaje (estado, fecha_hora);")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_precios_lookup ON precios (cliente_id, producto_id, fecha, tipo_venta, id);")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_movs_cliente_fecha ON movimientos_cliente (cliente_id, fecha_hora);")
+
     else:
         cur.execute("""
         CREATE TABLE IF NOT EXISTS clientes (
@@ -261,17 +290,15 @@ def init_db():
         );
         """)
 
+        # Índices (SQLite)
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_boletas_estado_fecha ON boletas_pesaje (estado, fecha_hora);")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_precios_lookup ON precios (cliente_id, producto_id, fecha, tipo_venta, id);")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_movs_cliente_fecha ON movimientos_cliente (cliente_id, fecha_hora);")
+
+    # Seed productos si está vacío
     db_execute(cur, "SELECT COUNT(*) AS c FROM productos")
     count_row = cur.fetchone()
-    # sqlite Row vs dict
-    if isinstance(count_row, dict):
-        count_val = count_row["c"]
-    else:
-        try:
-            count_val = count_row["c"]
-        except Exception:
-            count_val = count_row[0]
-
+    count_val = count_row["c"] if isinstance(count_row, dict) else count_row["c"]
     if int(count_val) == 0:
         productos_seed = [
             ("Pollo entero", "POLLO_ENTERO"),
@@ -280,21 +307,19 @@ def init_db():
             ("Pierna/Muslo", "PIERNA_MUSLO"),
             ("Alitas", "ALITAS"),
         ]
-        for nombre, codigo in productos_seed:
-            insert_and_get_id(
-                cur,
-                "INSERT INTO productos (nombre, codigo) VALUES (?, ?)",
-                (nombre, codigo),
-            )
+        for nombre, codigo_ in productos_seed:
+            insert_and_get_id(cur, "INSERT INTO productos (nombre, codigo) VALUES (?, ?)", (nombre, codigo_))
 
     conn.commit()
     close_conn(conn)
+
 
 @app.on_event("startup")
 def _startup():
     if IS_POSTGRES:
         init_pg_pool()
     init_db()
+
 
 # ---------------- AUTH / ROLES ----------------
 
@@ -305,6 +330,7 @@ def ensure_role(request: Request, allowed_roles: list[str]):
     if role not in allowed_roles:
         return error_card(request, "No tienes permiso para ver esta página.")
     return None
+
 
 def nav_html(role: Optional[str]) -> str:
     if not role:
@@ -318,6 +344,7 @@ def nav_html(role: Optional[str]) -> str:
             <a href="/logout">Salir</a>
         """
 
+    # Caja
     return """
         <a href="/">Inicio</a>
         <a href="/clientes">Clientes</a>
@@ -329,6 +356,7 @@ def nav_html(role: Optional[str]) -> str:
         <a href="/devoluciones/nueva">Devolución</a>
         <a href="/logout">Salir</a>
     """
+
 
 def layout(request: Request, title: str, body: str) -> HTMLResponse:
     role = request.session.get("role")
@@ -342,6 +370,7 @@ def layout(request: Request, title: str, body: str) -> HTMLResponse:
     <head>
         <title>{title}</title>
         <meta charset="utf-8" />
+        <meta name="viewport" content="width=device-width, initial-scale=1" />
         <style>
             body {{
                 font-family: system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
@@ -477,8 +506,10 @@ def layout(request: Request, title: str, body: str) -> HTMLResponse:
     """
     return HTMLResponse(content=html)
 
+
 def error_card(request: Request, msg: str) -> HTMLResponse:
     return layout(request, "Error", f"<div class='card error'><b>Error:</b> {msg}</div>")
+
 
 def login_page(request: Request, error: str = "") -> HTMLResponse:
     err_html = f"<div class='card error'><b>Error:</b> {error}</div>" if error else ""
@@ -498,62 +529,69 @@ def login_page(request: Request, error: str = "") -> HTMLResponse:
 
         <button class="btn btn-primary" type="submit">Entrar</button>
       </form>
-      <p><small>Cambia contraseñas con variables de entorno <b>CAJA_PASSWORD</b> y <b>BASCULA_PASSWORD</b>.</small></p>
+      <p><small>Contraseñas vienen de Railway: <b>CAJA_PASSWORD</b> y <b>BASCULA_PASSWORD</b>.</small></p>
     </div>
     """
     return layout(request, "Login", body)
+
 
 @app.get("/login", response_class=HTMLResponse)
 def login_get(request: Request):
     return login_page(request)
 
+
 @app.post("/login")
 async def login_post(request: Request):
     form = await request.form()
     username = (form.get("username") or "").strip()
-    password = (form.get("password") or "")
+    password = (form.get("password") or "").strip()
 
     if username == "Caja":
-        if verify_password(password, CAJA_PASSWORD_HASH):
+        if password == CAJA_PASSWORD:
             request.session["role"] = "Caja"
             return RedirectResponse(url="/", status_code=303)
         return login_page(request, "Contraseña incorrecta.")
 
     if username == "Bascula":
-        if verify_password(password, BASCULA_PASSWORD_HASH):
+        if password == BASCULA_PASSWORD:
             request.session["role"] = "Bascula"
             return RedirectResponse(url="/boletas/nueva", status_code=303)
         return login_page(request, "Contraseña incorrecta.")
 
     return login_page(request, "Usuario inválido.")
 
+
 @app.get("/logout")
 def logout(request: Request):
     request.session.clear()
     return RedirectResponse(url="/login", status_code=303)
 
+
 # ---------------- UTILIDADES ----------------
 
 def get_productos():
     conn = get_conn()
-    c = conn.cursor(cursor_factory=RealDictCursor) if IS_POSTGRES else conn.cursor()
+    c = cursor(conn)
     db_execute(c, "SELECT id, nombre, codigo FROM productos ORDER BY id")
     productos = c.fetchall()
     close_conn(conn)
     return productos
 
+
 def get_clientes():
     conn = get_conn()
-    c = conn.cursor(cursor_factory=RealDictCursor) if IS_POSTGRES else conn.cursor()
+    c = cursor(conn)
     db_execute(c, "SELECT id, nombre FROM clientes ORDER BY nombre")
     clientes = c.fetchall()
     close_conn(conn)
     return clientes
 
+
 def obtener_precio(cliente_id, producto_id, fecha_txt, tipo_venta):
     conn = get_conn()
-    c = conn.cursor(cursor_factory=RealDictCursor) if IS_POSTGRES else conn.cursor()
+    c = cursor(conn)
 
+    # 1) especial por cliente
     if cliente_id is not None:
         db_execute(c, """
             SELECT precio_por_kg FROM precios
@@ -565,6 +603,7 @@ def obtener_precio(cliente_id, producto_id, fecha_txt, tipo_venta):
             close_conn(conn)
             return float(row["precio_por_kg"])
 
+    # 2) general
     db_execute(c, """
         SELECT precio_por_kg FROM precios
         WHERE cliente_id IS NULL AND producto_id = ? AND fecha = ? AND tipo_venta = ?
@@ -575,6 +614,7 @@ def obtener_precio(cliente_id, producto_id, fecha_txt, tipo_venta):
     if row:
         return float(row["precio_por_kg"])
     return None
+
 
 # ---------------- HOME ----------------
 
@@ -600,6 +640,7 @@ def home(request: Request):
     """
     return layout(request, "Inicio", body)
 
+
 # ---------------- CLIENTES (Caja) ----------------
 
 @app.get("/clientes", response_class=HTMLResponse)
@@ -616,7 +657,7 @@ def clientes_list(request: Request, q: str = ""):
     antier_txt = antier.isoformat()
 
     conn = get_conn()
-    c = conn.cursor(cursor_factory=RealDictCursor) if IS_POSTGRES else conn.cursor()
+    c = cursor(conn)
 
     db_execute(c, "SELECT id FROM productos WHERE codigo = 'POLLO_ENTERO'")
     row_prod = c.fetchone()
@@ -723,6 +764,7 @@ def clientes_list(request: Request, q: str = ""):
     """
     return layout(request, "Clientes", body)
 
+
 @app.post("/clientes/crear")
 def clientes_crear(request: Request, nombre: str = Form(...), referencia: str = Form("")):
     guard = ensure_role(request, ["Caja"])
@@ -730,11 +772,12 @@ def clientes_crear(request: Request, nombre: str = Form(...), referencia: str = 
         return guard
 
     conn = get_conn()
-    c = conn.cursor(cursor_factory=RealDictCursor) if IS_POSTGRES else conn.cursor()
+    c = cursor(conn)
     insert_and_get_id(c, "INSERT INTO clientes (nombre, referencia) VALUES (?, ?)", (nombre, referencia))
     conn.commit()
     close_conn(conn)
     return RedirectResponse(url="/clientes", status_code=303)
+
 
 @app.post("/clientes/eliminar/{cliente_id}")
 def clientes_eliminar(request: Request, cliente_id: int):
@@ -743,7 +786,7 @@ def clientes_eliminar(request: Request, cliente_id: int):
         return guard
 
     conn = get_conn()
-    c = conn.cursor(cursor_factory=RealDictCursor) if IS_POSTGRES else conn.cursor()
+    c = cursor(conn)
 
     checks = [
         ("precios", "SELECT COUNT(*) AS c FROM precios WHERE cliente_id = ?", (cliente_id,)),
@@ -770,6 +813,7 @@ def clientes_eliminar(request: Request, cliente_id: int):
     close_conn(conn)
     return RedirectResponse(url="/clientes", status_code=303)
 
+
 @app.get("/clientes/ajuste/{cliente_id}", response_class=HTMLResponse)
 def cliente_ajuste_form(request: Request, cliente_id: int):
     guard = ensure_role(request, ["Caja"])
@@ -777,7 +821,7 @@ def cliente_ajuste_form(request: Request, cliente_id: int):
         return guard
 
     conn = get_conn()
-    c = conn.cursor(cursor_factory=RealDictCursor) if IS_POSTGRES else conn.cursor()
+    c = cursor(conn)
     db_execute(c, "SELECT id, nombre FROM clientes WHERE id = ?", (cliente_id,))
     cl = c.fetchone()
     close_conn(conn)
@@ -803,6 +847,7 @@ def cliente_ajuste_form(request: Request, cliente_id: int):
     """
     return layout(request, "Agregar saldo", body)
 
+
 @app.post("/clientes/ajuste/{cliente_id}")
 def cliente_ajuste_save(
     request: Request,
@@ -817,7 +862,7 @@ def cliente_ajuste_save(
     fecha_hora = datetime.now().isoformat(timespec="seconds")
 
     conn = get_conn()
-    c = conn.cursor(cursor_factory=RealDictCursor) if IS_POSTGRES else conn.cursor()
+    c = cursor(conn)
 
     db_execute(c, "SELECT id FROM clientes WHERE id = ?", (cliente_id,))
     if not c.fetchone():
@@ -832,6 +877,7 @@ def cliente_ajuste_save(
     conn.commit()
     close_conn(conn)
     return RedirectResponse(url="/clientes", status_code=303)
+
 
 # ---------------- PRECIOS (Caja) ----------------
 
@@ -889,6 +935,7 @@ def precios_form(request: Request):
     """
     return layout(request, "Precios", body)
 
+
 @app.post("/precios")
 async def precios_save(request: Request):
     guard = ensure_role(request, ["Caja"])
@@ -901,7 +948,7 @@ async def precios_save(request: Request):
     cliente_id = None if cliente_id_raw == "0" else int(cliente_id_raw)
 
     conn = get_conn()
-    c = conn.cursor(cursor_factory=RealDictCursor) if IS_POSTGRES else conn.cursor()
+    c = cursor(conn)
 
     productos = get_productos()
     for p in productos:
@@ -945,6 +992,7 @@ async def precios_save(request: Request):
     conn.commit()
     close_conn(conn)
     return RedirectResponse(url="/precios", status_code=303)
+
 
 # ---------------- BOLETAS (Bascula y Caja) ----------------
 
@@ -1000,6 +1048,7 @@ def boleta_form(request: Request):
     """
     return layout(request, "Nueva boleta", body)
 
+
 @app.post("/boletas/nueva")
 def boleta_crear(
     request: Request,
@@ -1019,7 +1068,7 @@ def boleta_crear(
     fecha_hora = datetime.now().isoformat(timespec="seconds")
 
     conn = get_conn()
-    c = conn.cursor(cursor_factory=RealDictCursor) if IS_POSTGRES else conn.cursor()
+    c = cursor(conn)
     insert_and_get_id(c, """
         INSERT INTO boletas_pesaje (fecha_hora, cliente_id, producto_id, tipo_venta,
                                    num_pollos, num_cajas, peso_total_kg,
@@ -1031,6 +1080,7 @@ def boleta_crear(
     close_conn(conn)
     return RedirectResponse(url="/boletas/pendientes", status_code=303)
 
+
 @app.get("/boletas/pendientes", response_class=HTMLResponse)
 def boletas_pendientes(request: Request):
     guard = ensure_role(request, ["Caja", "Bascula"])
@@ -1040,7 +1090,7 @@ def boletas_pendientes(request: Request):
     role = request.session.get("role")
 
     conn = get_conn()
-    c = conn.cursor(cursor_factory=RealDictCursor) if IS_POSTGRES else conn.cursor()
+    c = cursor(conn)
     db_execute(c, """
         SELECT b.id, b.fecha_hora, b.peso_total_kg, b.num_pollos, b.num_cajas,
                b.tipo_venta, p.nombre AS producto
@@ -1054,6 +1104,7 @@ def boletas_pendientes(request: Request):
 
     rows = ""
     for b in boletas:
+        # Bascula NO puede cobrar -> no botón
         accion_html = (
             f"<a class='btn btn-primary' href='/boletas/cobrar/{b['id']}'>Cobrar</a>"
             if role == "Caja"
@@ -1097,6 +1148,7 @@ def boletas_pendientes(request: Request):
     """
     return layout(request, "Boletas pendientes", body)
 
+
 @app.get("/boletas/cobradas", response_class=HTMLResponse)
 def boletas_cobradas(request: Request):
     guard = ensure_role(request, ["Caja"])
@@ -1104,7 +1156,7 @@ def boletas_cobradas(request: Request):
         return guard
 
     conn = get_conn()
-    c = conn.cursor(cursor_factory=RealDictCursor) if IS_POSTGRES else conn.cursor()
+    c = cursor(conn)
     db_execute(c, """
         SELECT
             v.id AS venta_id,
@@ -1175,6 +1227,7 @@ def boletas_cobradas(request: Request):
     """
     return layout(request, "Boletas cobradas", body)
 
+
 @app.get("/boletas/cobrar/{boleta_id}", response_class=HTMLResponse)
 def cobrar_boleta_form(request: Request, boleta_id: int):
     guard = ensure_role(request, ["Caja"])
@@ -1182,7 +1235,7 @@ def cobrar_boleta_form(request: Request, boleta_id: int):
         return guard
 
     conn = get_conn()
-    c = conn.cursor(cursor_factory=RealDictCursor) if IS_POSTGRES else conn.cursor()
+    c = cursor(conn)
     db_execute(c, """
         SELECT b.*, p.nombre AS producto
         FROM boletas_pesaje b
@@ -1220,6 +1273,7 @@ def cobrar_boleta_form(request: Request, boleta_id: int):
     """
     return layout(request, "Cobrar boleta", body)
 
+
 @app.post("/boletas/cobrar/{boleta_id}")
 def cobrar_boleta(
     request: Request,
@@ -1232,7 +1286,7 @@ def cobrar_boleta(
         return guard
 
     conn = get_conn()
-    c = conn.cursor(cursor_factory=RealDictCursor) if IS_POSTGRES else conn.cursor()
+    c = cursor(conn)
 
     db_execute(c, "SELECT * FROM boletas_pesaje WHERE id = ?", (boleta_id,))
     boleta = c.fetchone()
@@ -1295,6 +1349,7 @@ def cobrar_boleta(
     """
     return layout(request, "Venta generada", body)
 
+
 # ---------------- DEVOLUCIONES (Bascula y Caja) ----------------
 
 @app.get("/devoluciones/nueva", response_class=HTMLResponse)
@@ -1322,6 +1377,7 @@ def devolucion_form(request: Request):
     """
     return layout(request, "Devolución", body)
 
+
 @app.post("/devoluciones/nueva")
 def devolucion_crear(
     request: Request,
@@ -1334,7 +1390,7 @@ def devolucion_crear(
         return guard
 
     conn = get_conn()
-    c = conn.cursor(cursor_factory=RealDictCursor) if IS_POSTGRES else conn.cursor()
+    c = cursor(conn)
 
     db_execute(c, "SELECT * FROM ventas WHERE id = ?", (venta_id,))
     venta = c.fetchone()
@@ -1373,6 +1429,7 @@ def devolucion_crear(
     """
     return layout(request, "Devolución registrada", body)
 
+
 # ---------------- SALDOS (Caja) ----------------
 
 @app.get("/clientes/saldos", response_class=HTMLResponse)
@@ -1396,6 +1453,7 @@ def saldo_selector(request: Request):
     """
     return layout(request, "Saldos clientes", body)
 
+
 @app.get("/clientes/saldo", response_class=HTMLResponse)
 def saldo_cliente(request: Request, cliente_id: int):
     guard = ensure_role(request, ["Caja"])
@@ -1403,7 +1461,7 @@ def saldo_cliente(request: Request, cliente_id: int):
         return guard
 
     conn = get_conn()
-    c = conn.cursor(cursor_factory=RealDictCursor) if IS_POSTGRES else conn.cursor()
+    c = cursor(conn)
 
     db_execute(c, "SELECT nombre FROM clientes WHERE id = ?", (cliente_id,))
     row = c.fetchone()
