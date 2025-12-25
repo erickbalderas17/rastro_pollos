@@ -4,9 +4,11 @@ from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from datetime import datetime, date, timedelta
 import os, sqlite3
+from typing import Optional
 
 import psycopg2
 from psycopg2.extras import RealDictCursor
+from psycopg2.pool import ThreadedConnectionPool
 from starlette.middleware.sessions import SessionMiddleware
 from passlib.context import CryptContext
 
@@ -15,63 +17,88 @@ from passlib.context import CryptContext
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DB_PATH = os.path.join(BASE_DIR, "rastro.db")
 
-DATABASE_URL = os.getenv("DATABASE_URL")  # en Railway/Supabase (no se usa directo aquí)
 APP_SECRET = os.getenv("APP_SECRET", "dev-secret")
 
 IS_POSTGRES = bool(os.getenv("PGHOST"))
 
+# Usuarios (cámbialos en Railway/Supabase como variables de entorno)
+CAJA_PASSWORD = os.getenv("CAJA_PASSWORD", "caja123")
+BASCULA_PASSWORD = os.getenv("BASCULA_PASSWORD", "bascula123")
+
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+
+# Hash en memoria (simple, sin tabla de usuarios)
+CAJA_PASSWORD_HASH = pwd_context.hash(CAJA_PASSWORD)
+BASCULA_PASSWORD_HASH = pwd_context.hash(BASCULA_PASSWORD)
+
+# Pool Postgres (más rápido que abrir/cerrar conexión en cada request)
+PG_POOL: Optional[ThreadedConnectionPool] = None
 
 # ---------------- APP ----------------
 
 app = FastAPI()
 app.add_middleware(SessionMiddleware, secret_key=APP_SECRET)
 
-# static (no debe crashear si no hay logo)
+# static
 STATIC_DIR = os.path.join(BASE_DIR, "static")
 os.makedirs(STATIC_DIR, exist_ok=True)
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
-
 # ---------------- DB HELPERS ----------------
 
+def init_pg_pool():
+    global PG_POOL
+    if not IS_POSTGRES:
+        return
+    if PG_POOL is not None:
+        return
+
+    PG_POOL = ThreadedConnectionPool(
+        minconn=int(os.getenv("PG_POOL_MIN", "1")),
+        maxconn=int(os.getenv("PG_POOL_MAX", "8")),
+        host=os.getenv("PGHOST"),
+        port=int(os.getenv("PGPORT", "5432")),
+        dbname=os.getenv("PGDATABASE", "postgres"),
+        user=os.getenv("PGUSER"),
+        password=os.getenv("PGPASSWORD"),
+        sslmode=os.getenv("PGSSLMODE", "require"),
+        connect_timeout=10,
+    )
+
 def get_conn():
-    pg_host = os.getenv("PGHOST")
+    if IS_POSTGRES:
+        if PG_POOL is None:
+            init_pg_pool()
+        conn = PG_POOL.getconn()
+        conn.cursor_factory = RealDictCursor
+        return conn
 
-    if pg_host:
-        return psycopg2.connect(
-            host=pg_host,
-            port=int(os.getenv("PGPORT", "5432")),
-            dbname=os.getenv("PGDATABASE", "postgres"),
-            user=os.getenv("PGUSER"),
-            password=os.getenv("PGPASSWORD"),
-            sslmode=os.getenv("PGSSLMODE", "require"),
-            cursor_factory=RealDictCursor,
-            connect_timeout=10,
-        )
-
-    # fallback sqlite local
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     return conn
 
+def close_conn(conn):
+    if IS_POSTGRES:
+        try:
+            if conn:
+                PG_POOL.putconn(conn)
+        except Exception:
+            try:
+                conn.close()
+            except Exception:
+                pass
+    else:
+        try:
+            conn.close()
+        except Exception:
+            pass
 
 def db_execute(cur, query: str, params=()):
-    """
-    Escribe consultas con '?' siempre.
-    En Postgres se convierte a %s automáticamente.
-    """
     if IS_POSTGRES:
         query = query.replace("?", "%s")
     cur.execute(query, params)
 
-
 def insert_and_get_id(cur, query: str, params=()):
-    """
-    Inserta y regresa el ID creado.
-    - SQLite: lastrowid
-    - Postgres: RETURNING id
-    """
     if IS_POSTGRES:
         q = query.replace("?", "%s").rstrip().rstrip(";") + " RETURNING id"
         cur.execute(q, params)
@@ -80,13 +107,11 @@ def insert_and_get_id(cur, query: str, params=()):
     cur.execute(query, params)
     return cur.lastrowid
 
-
 def init_db():
     conn = get_conn()
     cur = conn.cursor()
 
     if IS_POSTGRES:
-        # Tablas (Postgres)
         cur.execute("""
         CREATE TABLE IF NOT EXISTS clientes (
             id SERIAL PRIMARY KEY,
@@ -160,7 +185,6 @@ def init_db():
         );
         """)
     else:
-        # Tablas (SQLite)
         cur.execute("""
         CREATE TABLE IF NOT EXISTS clientes (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -234,7 +258,6 @@ def init_db():
         );
         """)
 
-    # Seed productos si está vacío
     db_execute(cur, "SELECT COUNT(*) AS c FROM productos")
     count_row = cur.fetchone()
     count_val = count_row["c"] if isinstance(count_row, dict) else count_row["c"]
@@ -254,17 +277,55 @@ def init_db():
             )
 
     conn.commit()
-    conn.close()
-
+    close_conn(conn)
 
 @app.on_event("startup")
 def _startup():
+    if IS_POSTGRES:
+        init_pg_pool()
     init_db()
 
+# ---------------- AUTH / ROLES ----------------
 
-# ---------- LAYOUT / HTML ---------- #
+def ensure_role(request: Request, allowed_roles: list[str]):
+    role = request.session.get("role")
+    if not role:
+        return RedirectResponse(url="/login", status_code=303)
+    if role not in allowed_roles:
+        return error_card(request, "No tienes permiso para ver esta página.")
+    return None
 
-def layout(title: str, body: str) -> HTMLResponse:
+def nav_html(role: Optional[str]) -> str:
+    if not role:
+        return '<a href="/login">Login</a>'
+
+    if role == "Bascula":
+        return """
+            <a href="/boletas/nueva">Nueva boleta</a>
+            <a href="/boletas/pendientes">Boletas pendientes</a>
+            <a href="/devoluciones/nueva">Devolución</a>
+            <a href="/logout">Salir</a>
+        """
+
+    return """
+        <a href="/">Inicio</a>
+        <a href="/clientes">Clientes</a>
+        <a href="/precios">Precios del día</a>
+        <a href="/boletas/nueva">Nueva boleta</a>
+        <a href="/boletas/pendientes">Boletas pendientes</a>
+        <a href="/boletas/cobradas">Boletas cobradas</a>
+        <a href="/clientes/saldos">Saldos clientes</a>
+        <a href="/devoluciones/nueva">Devolución</a>
+        <a href="/logout">Salir</a>
+    """
+
+def layout(request: Request, title: str, body: str) -> HTMLResponse:
+    role = request.session.get("role")
+    role_badge = (
+        f"<span style='margin-left:10px;color:#d1d5db;font-size:12px;'>Usuario: <b>{role}</b></span>"
+        if role else ""
+    )
+
     html = f"""
     <html>
     <head>
@@ -294,6 +355,7 @@ def layout(title: str, body: str) -> HTMLResponse:
             header .title-block {{
                 display: flex;
                 flex-direction: column;
+                width: 100%;
             }}
             header .title-block h1 {{
                 margin: 0;
@@ -391,18 +453,9 @@ def layout(title: str, body: str) -> HTMLResponse:
             <img src="/static/logo_san_pablito.png" class="logo"
                  alt="Procesadora y Distribuidora Avícola San Pablito" />
             <div class="title-block">
-                <h1>Procesadora y Distribuidora Avícola San Pablito</h1>
+                <h1>Procesadora y Distribuidora Avícola San Pablito{role_badge}</h1>
                 <span>Sistema de pesaje, precios, créditos y devoluciones</span>
-                <nav>
-                    <a href="/">Inicio</a>
-                    <a href="/clientes">Clientes</a>
-                    <a href="/precios">Precios del día</a>
-                    <a href="/boletas/nueva">Nueva boleta</a>
-                    <a href="/boletas/pendientes">Boletas pendientes</a>
-                    <a href="/boletas/cobradas">Boletas cobradas</a>
-                    <a href="/clientes/saldos">Saldos clientes</a>
-                    <a href="/devoluciones/nueva">Devolución</a>
-                </nav>
+                <nav>{nav_html(role)}</nav>
             </div>
         </header>
         <div class="container">
@@ -413,80 +466,82 @@ def layout(title: str, body: str) -> HTMLResponse:
     """
     return HTMLResponse(content=html)
 
+def error_card(request: Request, msg: str) -> HTMLResponse:
+    return layout(request, "Error", f"<div class='card error'><b>Error:</b> {msg}</div>")
 
-def error_card(msg: str) -> HTMLResponse:
-    return layout("Error", f"<div class='card error'><b>Error:</b> {msg}</div>")
+def login_page(request: Request, error: str = "") -> HTMLResponse:
+    err_html = f"<div class='card error'><b>Error:</b> {error}</div>" if error else ""
+    body = f"""
+    <h2>Iniciar sesión</h2>
+    {err_html}
+    <div class="card">
+      <form method="post" action="/login">
+        <label>Usuario</label>
+        <select name="username" required>
+          <option value="Caja">Caja</option>
+          <option value="Bascula">Bascula</option>
+        </select>
 
+        <label>Contraseña</label>
+        <input type="password" name="password" required />
 
-# ---------- UTILIDADES (con cache simple en memoria) ---------- #
+        <button class="btn btn-primary" type="submit">Entrar</button>
+      </form>
+      <p><small>Cambia contraseñas con variables de entorno <b>CAJA_PASSWORD</b> y <b>BASCULA_PASSWORD</b>.</small></p>
+    </div>
+    """
+    return layout(request, "Login", body)
 
-# Cache muy simple para reducir roundtrips (suficiente para una app chica).
-# Nota: en Railway puede haber múltiples workers/procesos, el cache es por proceso.
-_CACHE = {
-    "productos": {"ts": 0.0, "data": None},
-    "clientes": {"ts": 0.0, "data": None},
-}
-_CACHE_TTL_SECONDS = 10.0
+@app.get("/login", response_class=HTMLResponse)
+def login_get(request: Request):
+    return login_page(request)
 
+@app.post("/login")
+async def login_post(request: Request):
+    form = await request.form()
+    username = (form.get("username") or "").strip()
+    password = (form.get("password") or "")
 
-def _now_ts() -> float:
-    return datetime.now().timestamp()
+    if username == "Caja":
+        if pwd_context.verify(password, CAJA_PASSWORD_HASH):
+            request.session["role"] = "Caja"
+            return RedirectResponse(url="/", status_code=303)
+        return login_page(request, "Contraseña incorrecta.")
 
+    if username == "Bascula":
+        if pwd_context.verify(password, BASCULA_PASSWORD_HASH):
+            request.session["role"] = "Bascula"
+            return RedirectResponse(url="/boletas/nueva", status_code=303)
+        return login_page(request, "Contraseña incorrecta.")
 
-def cache_get(key: str):
-    item = _CACHE.get(key)
-    if not item:
-        return None
-    if item["data"] is None:
-        return None
-    if (_now_ts() - float(item["ts"])) > _CACHE_TTL_SECONDS:
-        return None
-    return item["data"]
+    return login_page(request, "Usuario inválido.")
 
+@app.get("/logout")
+def logout(request: Request):
+    request.session.clear()
+    return RedirectResponse(url="/login", status_code=303)
 
-def cache_set(key: str, data):
-    _CACHE[key] = {"ts": _now_ts(), "data": data}
-
-
-def cache_bust(*keys: str):
-    for k in keys:
-        if k in _CACHE:
-            _CACHE[k] = {"ts": 0.0, "data": None}
-
+# ---------------- UTILIDADES ----------------
 
 def get_productos():
-    cached = cache_get("productos")
-    if cached is not None:
-        return cached
     conn = get_conn()
-    c = conn.cursor()
+    c = conn.cursor(cursor_factory=RealDictCursor) if IS_POSTGRES else conn.cursor()
     db_execute(c, "SELECT id, nombre, codigo FROM productos ORDER BY id")
     productos = c.fetchall()
-    conn.close()
-    cache_set("productos", productos)
+    close_conn(conn)
     return productos
 
-
 def get_clientes():
-    cached = cache_get("clientes")
-    if cached is not None:
-        return cached
     conn = get_conn()
-    c = conn.cursor()
+    c = conn.cursor(cursor_factory=RealDictCursor) if IS_POSTGRES else conn.cursor()
     db_execute(c, "SELECT id, nombre FROM clientes ORDER BY nombre")
     clientes = c.fetchall()
-    conn.close()
-    cache_set("clientes", clientes)
+    close_conn(conn)
     return clientes
 
-
 def obtener_precio(cliente_id, producto_id, fecha_txt, tipo_venta):
-    """
-    Se mantiene para otras pantallas (1 boleta = 1 consulta aquí es ok),
-    pero para /clientes ya NO se usa (allí hacemos batch).
-    """
     conn = get_conn()
-    c = conn.cursor()
+    c = conn.cursor(cursor_factory=RealDictCursor) if IS_POSTGRES else conn.cursor()
 
     if cliente_id is not None:
         db_execute(c, """
@@ -496,7 +551,7 @@ def obtener_precio(cliente_id, producto_id, fecha_txt, tipo_venta):
         """, (cliente_id, producto_id, fecha_txt, tipo_venta))
         row = c.fetchone()
         if row:
-            conn.close()
+            close_conn(conn)
             return float(row["precio_por_kg"])
 
     db_execute(c, """
@@ -505,49 +560,19 @@ def obtener_precio(cliente_id, producto_id, fecha_txt, tipo_venta):
         ORDER BY id DESC LIMIT 1
     """, (producto_id, fecha_txt, tipo_venta))
     row = c.fetchone()
-    conn.close()
+    close_conn(conn)
     if row:
         return float(row["precio_por_kg"])
     return None
 
-
-def obtener_precios_lote(producto_id: int, fechas: list[str], tipo_venta: str = "normal"):
-    """
-    Trae TODOS los precios de (producto_id, fechas, tipo_venta) en UNA sola consulta.
-    Regresa dict: {(cliente_id, fecha): precio_float}
-    cliente_id puede ser None (precio general).
-    """
-    if producto_id is None or not fechas:
-        return {}
-
-    conn = get_conn()
-    c = conn.cursor()
-
-    placeholders = ",".join(["?"] * len(fechas))
-    q = f"""
-        SELECT cliente_id, fecha, precio_por_kg
-        FROM precios
-        WHERE producto_id = ?
-          AND tipo_venta = ?
-          AND fecha IN ({placeholders})
-    """
-    params = [producto_id, tipo_venta] + list(fechas)
-    db_execute(c, q, params)
-    rows = c.fetchall()
-    conn.close()
-
-    out = {}
-    for r in rows:
-        cid = r["cliente_id"]  # puede venir None
-        f = r["fecha"]
-        out[(cid, f)] = float(r["precio_por_kg"])
-    return out
-
-
-# ---------- HOME ---------- #
+# ---------------- HOME ----------------
 
 @app.get("/", response_class=HTMLResponse)
-def home():
+def home(request: Request):
+    guard = ensure_role(request, ["Caja", "Bascula"])
+    if guard:
+        return guard
+
     body = """
     <h2>Sistema Rastro Pollos</h2>
     <div class="card">
@@ -562,13 +587,16 @@ def home():
         </ul>
     </div>
     """
-    return layout("Inicio", body)
+    return layout(request, "Inicio", body)
 
-
-# ---------- CLIENTES (Buscador + batch precios) ---------- #
+# ---------------- CLIENTES (Caja) ----------------
 
 @app.get("/clientes", response_class=HTMLResponse)
-def clientes_list(q: str = ""):
+def clientes_list(request: Request, q: str = ""):
+    guard = ensure_role(request, ["Caja"])
+    if guard:
+        return guard
+
     hoy = date.today()
     ayer = hoy - timedelta(days=1)
     antier = hoy - timedelta(days=2)
@@ -577,57 +605,46 @@ def clientes_list(q: str = ""):
     antier_txt = antier.isoformat()
 
     conn = get_conn()
-    c = conn.cursor()
+    c = conn.cursor(cursor_factory=RealDictCursor) if IS_POSTGRES else conn.cursor()
 
     db_execute(c, "SELECT id FROM productos WHERE codigo = 'POLLO_ENTERO'")
     row_prod = c.fetchone()
     producto_base_id = row_prod["id"] if row_prod else None
 
     q = (q or "").strip()
-
     if q:
         if q.isdigit():
             db_execute(c, "SELECT id, nombre, referencia FROM clientes WHERE id = ? ORDER BY id", (int(q),))
         else:
             like = f"%{q}%"
-            # OJO: en Postgres LIKE es case-sensitive; si quieres case-insensitive usa ILIKE.
-            if IS_POSTGRES:
-                db_execute(
-                    c,
-                    "SELECT id, nombre, referencia FROM clientes WHERE nombre ILIKE ? OR referencia ILIKE ? ORDER BY id",
-                    (like, like),
-                )
-            else:
-                db_execute(
-                    c,
-                    "SELECT id, nombre, referencia FROM clientes WHERE nombre LIKE ? OR referencia LIKE ? ORDER BY id",
-                    (like, like),
-                )
+            db_execute(
+                c,
+                "SELECT id, nombre, referencia FROM clientes WHERE nombre LIKE ? OR referencia LIKE ? ORDER BY id",
+                (like, like),
+            )
     else:
         db_execute(c, "SELECT id, nombre, referencia FROM clientes ORDER BY id")
 
     clientes = c.fetchall()
-    conn.close()
-
-    # ---- OPTIMIZACIÓN CLAVE: batch de precios (1 query total) ----
-    fechas = [antier_txt, ayer_txt, hoy_txt]
-    precios_map = obtener_precios_lote(producto_base_id, fechas, tipo_venta="normal")
-
-    def get_precio(cid, ftxt):
-        # 1) precio especial
-        val = precios_map.get((cid, ftxt))
-        if val is not None:
-            return val
-        # 2) precio general
-        return precios_map.get((None, ftxt))
+    close_conn(conn)
 
     rows_html = ""
     for cl in clientes:
         ref = cl["referencia"] or ""
 
-        precio_antier = get_precio(cl["id"], antier_txt)
-        precio_ayer = get_precio(cl["id"], ayer_txt)
-        precio_hoy = get_precio(cl["id"], hoy_txt)
+        if producto_base_id is not None:
+            precio_hoy = obtener_precio(cl["id"], producto_base_id, hoy_txt, "normal")
+            precio_ayer = obtener_precio(cl["id"], producto_base_id, ayer_txt, "normal")
+            precio_antier = obtener_precio(cl["id"], producto_base_id, antier_txt, "normal")
+
+            if precio_hoy is None:
+                precio_hoy = obtener_precio(None, producto_base_id, hoy_txt, "normal")
+            if precio_ayer is None:
+                precio_ayer = obtener_precio(None, producto_base_id, ayer_txt, "normal")
+            if precio_antier is None:
+                precio_antier = obtener_precio(None, producto_base_id, antier_txt, "normal")
+        else:
+            precio_hoy = precio_ayer = precio_antier = None
 
         texto_antier = f"${precio_antier:.2f}" if precio_antier is not None else "-"
         texto_ayer = f"${precio_ayer:.2f}" if precio_ayer is not None else "-"
@@ -693,24 +710,29 @@ def clientes_list(q: str = ""):
         </table>
     </div>
     """
-    return layout("Clientes", body)
-
+    return layout(request, "Clientes", body)
 
 @app.post("/clientes/crear")
-def clientes_crear(nombre: str = Form(...), referencia: str = Form("")):
+def clientes_crear(request: Request, nombre: str = Form(...), referencia: str = Form("")):
+    guard = ensure_role(request, ["Caja"])
+    if guard:
+        return guard
+
     conn = get_conn()
-    c = conn.cursor()
+    c = conn.cursor(cursor_factory=RealDictCursor) if IS_POSTGRES else conn.cursor()
     insert_and_get_id(c, "INSERT INTO clientes (nombre, referencia) VALUES (?, ?)", (nombre, referencia))
     conn.commit()
-    conn.close()
-    cache_bust("clientes")  # <- importante
+    close_conn(conn)
     return RedirectResponse(url="/clientes", status_code=303)
 
-
 @app.post("/clientes/eliminar/{cliente_id}")
-def clientes_eliminar(cliente_id: int):
+def clientes_eliminar(request: Request, cliente_id: int):
+    guard = ensure_role(request, ["Caja"])
+    if guard:
+        return guard
+
     conn = get_conn()
-    c = conn.cursor()
+    c = conn.cursor(cursor_factory=RealDictCursor) if IS_POSTGRES else conn.cursor()
 
     checks = [
         ("precios", "SELECT COUNT(*) AS c FROM precios WHERE cliente_id = ?", (cliente_id,)),
@@ -725,40 +747,39 @@ def clientes_eliminar(cliente_id: int):
         row = c.fetchone()
         cnt = row["c"] if row is not None else 0
         if int(cnt) > 0:
-            conn.close()
+            close_conn(conn)
             return error_card(
+                request,
                 f"No puedo borrar el cliente porque tiene {cnt} registro(s) en '{tabla}'. "
                 "Primero elimina/ajusta esos registros, o implementamos borrado en cascada."
             )
 
     db_execute(c, "DELETE FROM clientes WHERE id = ?", (cliente_id,))
     conn.commit()
-    conn.close()
-    cache_bust("clientes")
+    close_conn(conn)
     return RedirectResponse(url="/clientes", status_code=303)
 
-
-# ---- AJUSTE DE SALDO ----
-
 @app.get("/clientes/ajuste/{cliente_id}", response_class=HTMLResponse)
-def cliente_ajuste_form(cliente_id: int):
+def cliente_ajuste_form(request: Request, cliente_id: int):
+    guard = ensure_role(request, ["Caja"])
+    if guard:
+        return guard
+
     conn = get_conn()
-    c = conn.cursor()
+    c = conn.cursor(cursor_factory=RealDictCursor) if IS_POSTGRES else conn.cursor()
     db_execute(c, "SELECT id, nombre FROM clientes WHERE id = ?", (cliente_id,))
     cl = c.fetchone()
-    conn.close()
+    close_conn(conn)
 
     if not cl:
-        return error_card("Cliente no encontrado.")
+        return error_card(request, "Cliente no encontrado.")
 
     body = f"""
     <h2>Agregar saldo (ajuste) — {cl['nombre']}</h2>
     <div class="card">
-        <p>
-            Usa <b>positivo</b> para saldo a favor (abono) y <b>negativo</b> para saldo en contra (cargo).
-        </p>
+        <p>Usa <b>positivo</b> para abono y <b>negativo</b> para cargo.</p>
         <form action="/clientes/ajuste/{cliente_id}" method="post">
-            <label>Monto del ajuste (puede ser negativo)</label>
+            <label>Monto del ajuste</label>
             <input type="number" step="0.01" name="monto" required />
 
             <label>Referencia (opcional)</label>
@@ -769,24 +790,28 @@ def cliente_ajuste_form(cliente_id: int):
         </form>
     </div>
     """
-    return layout("Agregar saldo", body)
-
+    return layout(request, "Agregar saldo", body)
 
 @app.post("/clientes/ajuste/{cliente_id}")
 def cliente_ajuste_save(
+    request: Request,
     cliente_id: int,
     monto: float = Form(...),
     referencia_id: int = Form(0),
 ):
+    guard = ensure_role(request, ["Caja"])
+    if guard:
+        return guard
+
     fecha_hora = datetime.now().isoformat(timespec="seconds")
 
     conn = get_conn()
-    c = conn.cursor()
+    c = conn.cursor(cursor_factory=RealDictCursor) if IS_POSTGRES else conn.cursor()
 
     db_execute(c, "SELECT id FROM clientes WHERE id = ?", (cliente_id,))
     if not c.fetchone():
-        conn.close()
-        return error_card("Cliente no encontrado.")
+        close_conn(conn)
+        return error_card(request, "Cliente no encontrado.")
 
     insert_and_get_id(c, """
         INSERT INTO movimientos_cliente (fecha_hora, cliente_id, tipo, referencia_id, monto)
@@ -794,14 +819,17 @@ def cliente_ajuste_save(
     """, (fecha_hora, cliente_id, int(referencia_id), float(monto)))
 
     conn.commit()
-    conn.close()
+    close_conn(conn)
     return RedirectResponse(url="/clientes", status_code=303)
 
-
-# ---------- PRECIOS DEL DÍA ----------
+# ---------------- PRECIOS (Caja) ----------------
 
 @app.get("/precios", response_class=HTMLResponse)
-def precios_form():
+def precios_form(request: Request):
+    guard = ensure_role(request, ["Caja"])
+    if guard:
+        return guard
+
     productos = get_productos()
     clientes = get_clientes()
     hoy = date.today().isoformat()
@@ -829,9 +857,7 @@ def precios_form():
             <input type="date" name="fecha" value="{hoy}" required />
 
             <label>Cliente</label>
-            <select name="cliente_id">
-                {opciones_clientes}
-            </select>
+            <select name="cliente_id">{opciones_clientes}</select>
 
             <p><strong>Captura precios por kg:</strong></p>
             <table>
@@ -843,27 +869,28 @@ def precios_form():
                         <th>Precio menudeo (pollo entero y vivo)</th>
                     </tr>
                 </thead>
-                <tbody>
-                    {filas}
-                </tbody>
+                <tbody>{filas}</tbody>
             </table>
 
             <p><button class="btn btn-primary" type="submit">Guardar precios</button></p>
         </form>
     </div>
     """
-    return layout("Precios", body)
-
+    return layout(request, "Precios", body)
 
 @app.post("/precios")
 async def precios_save(request: Request):
+    guard = ensure_role(request, ["Caja"])
+    if guard:
+        return guard
+
     form = await request.form()
     fecha = form.get("fecha")
     cliente_id_raw = form.get("cliente_id", "0")
     cliente_id = None if cliente_id_raw == "0" else int(cliente_id_raw)
 
     conn = get_conn()
-    c = conn.cursor()
+    c = conn.cursor(cursor_factory=RealDictCursor) if IS_POSTGRES else conn.cursor()
 
     productos = get_productos()
     for p in productos:
@@ -905,14 +932,17 @@ async def precios_save(request: Request):
                     pass
 
     conn.commit()
-    conn.close()
+    close_conn(conn)
     return RedirectResponse(url="/precios", status_code=303)
 
-
-# ---------- BOLETAS ----------
+# ---------------- BOLETAS (Bascula y Caja) ----------------
 
 @app.get("/boletas/nueva", response_class=HTMLResponse)
-def boleta_form():
+def boleta_form(request: Request):
+    guard = ensure_role(request, ["Caja", "Bascula"])
+    if guard:
+        return guard
+
     clientes = get_clientes()
     productos = get_productos()
 
@@ -957,11 +987,11 @@ def boleta_form():
         </form>
     </div>
     """
-    return layout("Nueva boleta", body)
-
+    return layout(request, "Nueva boleta", body)
 
 @app.post("/boletas/nueva")
 def boleta_crear(
+    request: Request,
     cliente_id: int = Form(0),
     producto_id: int = Form(...),
     tipo_venta: str = Form(...),
@@ -970,11 +1000,15 @@ def boleta_crear(
     peso_total_kg: float = Form(...),
     comentarios: str = Form(""),
 ):
+    guard = ensure_role(request, ["Caja", "Bascula"])
+    if guard:
+        return guard
+
     cliente_id_val = None if cliente_id == 0 else cliente_id
     fecha_hora = datetime.now().isoformat(timespec="seconds")
 
     conn = get_conn()
-    c = conn.cursor()
+    c = conn.cursor(cursor_factory=RealDictCursor) if IS_POSTGRES else conn.cursor()
     insert_and_get_id(c, """
         INSERT INTO boletas_pesaje (fecha_hora, cliente_id, producto_id, tipo_venta,
                                    num_pollos, num_cajas, peso_total_kg,
@@ -983,15 +1017,19 @@ def boleta_crear(
     """, (fecha_hora, cliente_id_val, producto_id, tipo_venta,
           num_pollos, num_cajas, peso_total_kg, comentarios))
     conn.commit()
-    conn.close()
-
+    close_conn(conn)
     return RedirectResponse(url="/boletas/pendientes", status_code=303)
 
-
 @app.get("/boletas/pendientes", response_class=HTMLResponse)
-def boletas_pendientes():
+def boletas_pendientes(request: Request):
+    guard = ensure_role(request, ["Caja", "Bascula"])
+    if guard:
+        return guard
+
+    role = request.session.get("role")
+
     conn = get_conn()
-    c = conn.cursor()
+    c = conn.cursor(cursor_factory=RealDictCursor) if IS_POSTGRES else conn.cursor()
     db_execute(c, """
         SELECT b.id, b.fecha_hora, b.peso_total_kg, b.num_pollos, b.num_cajas,
                b.tipo_venta, p.nombre AS producto
@@ -1001,10 +1039,17 @@ def boletas_pendientes():
         ORDER BY b.fecha_hora
     """)
     boletas = c.fetchall()
-    conn.close()
+    close_conn(conn)
 
     rows = ""
     for b in boletas:
+        # Si es Bascula, NO mostrar botón Cobrar
+        accion_html = (
+            f"<a class='btn btn-primary' href='/boletas/cobrar/{b['id']}'>Cobrar</a>"
+            if role == "Caja"
+            else "<span style='color:#6b7280; font-size:12px;'>—</span>"
+        )
+
         rows += f"""
         <tr>
             <td>{b['id']}</td>
@@ -1014,7 +1059,7 @@ def boletas_pendientes():
             <td>{b['num_cajas']}</td>
             <td>{float(b['peso_total_kg']):.3f}</td>
             <td>{b['tipo_venta']}</td>
-            <td><a class="btn btn-primary" href="/boletas/cobrar/{b['id']}">Cobrar</a></td>
+            <td>{accion_html}</td>
         </tr>
         """
 
@@ -1040,13 +1085,16 @@ def boletas_pendientes():
         </table>
     </div>
     """
-    return layout("Boletas pendientes", body)
-
+    return layout(request, "Boletas pendientes", body)
 
 @app.get("/boletas/cobradas", response_class=HTMLResponse)
-def boletas_cobradas():
+def boletas_cobradas(request: Request):
+    guard = ensure_role(request, ["Caja"])
+    if guard:
+        return guard
+
     conn = get_conn()
-    c = conn.cursor()
+    c = conn.cursor(cursor_factory=RealDictCursor) if IS_POSTGRES else conn.cursor()
     db_execute(c, """
         SELECT
             v.id AS venta_id,
@@ -1070,7 +1118,7 @@ def boletas_cobradas():
         LIMIT 200
     """)
     rows_db = c.fetchall()
-    conn.close()
+    close_conn(conn)
 
     rows_html = ""
     for r in rows_db:
@@ -1115,13 +1163,16 @@ def boletas_cobradas():
         </table>
     </div>
     """
-    return layout("Boletas cobradas", body)
-
+    return layout(request, "Boletas cobradas", body)
 
 @app.get("/boletas/cobrar/{boleta_id}", response_class=HTMLResponse)
-def cobrar_boleta_form(boleta_id: int):
+def cobrar_boleta_form(request: Request, boleta_id: int):
+    guard = ensure_role(request, ["Caja"])
+    if guard:
+        return guard
+
     conn = get_conn()
-    c = conn.cursor()
+    c = conn.cursor(cursor_factory=RealDictCursor) if IS_POSTGRES else conn.cursor()
     db_execute(c, """
         SELECT b.*, p.nombre AS producto
         FROM boletas_pesaje b
@@ -1129,10 +1180,10 @@ def cobrar_boleta_form(boleta_id: int):
         WHERE b.id = ?
     """, (boleta_id,))
     boleta = c.fetchone()
-    conn.close()
+    close_conn(conn)
 
     if not boleta:
-        return error_card("Boleta no encontrada.")
+        return error_card(request, "Boleta no encontrada.")
 
     body = f"""
     <h2>Cobrar boleta #{boleta_id}</h2>
@@ -1157,28 +1208,31 @@ def cobrar_boleta_form(boleta_id: int):
         </form>
     </div>
     """
-    return layout("Cobrar boleta", body)
-
+    return layout(request, "Cobrar boleta", body)
 
 @app.post("/boletas/cobrar/{boleta_id}")
 def cobrar_boleta(
+    request: Request,
     boleta_id: int,
     peso_caja_kg: float = Form(...),
     metodo_pago: str = Form(...),
 ):
+    guard = ensure_role(request, ["Caja"])
+    if guard:
+        return guard
+
     conn = get_conn()
-    c = conn.cursor()
+    c = conn.cursor(cursor_factory=RealDictCursor) if IS_POSTGRES else conn.cursor()
 
     db_execute(c, "SELECT * FROM boletas_pesaje WHERE id = ?", (boleta_id,))
     boleta = c.fetchone()
 
     if not boleta:
-        conn.close()
-        return error_card("Boleta no encontrada.")
-
+        close_conn(conn)
+        return error_card(request, "Boleta no encontrada.")
     if boleta["estado"] != "abierta":
-        conn.close()
-        return error_card("La boleta ya fue cerrada.")
+        close_conn(conn)
+        return error_card(request, "La boleta ya fue cerrada.")
 
     peso_total = float(boleta["peso_total_kg"])
     num_cajas = int(boleta["num_cajas"])
@@ -1190,13 +1244,13 @@ def cobrar_boleta(
 
     precio_por_kg = obtener_precio(cliente_id, producto_id, fecha_txt, tipo_venta)
     if precio_por_kg is None:
-        conn.close()
-        return error_card("No hay precio configurado para ese día/cliente/tipo.")
+        close_conn(conn)
+        return error_card(request, "No hay precio configurado para ese día/cliente/tipo.")
 
     peso_neto = peso_total - (num_cajas * float(peso_caja_kg))
     if peso_neto <= 0:
-        conn.close()
-        return error_card("Peso neto menor o igual a 0. Revisa datos.")
+        close_conn(conn)
+        return error_card(request, "Peso neto menor o igual a 0. Revisa datos.")
 
     total = round(peso_neto * float(precio_por_kg), 2)
 
@@ -1216,7 +1270,7 @@ def cobrar_boleta(
         """, (fecha_hora, cliente_id, venta_id, total))
 
     conn.commit()
-    conn.close()
+    close_conn(conn)
 
     body = f"""
     <h2>Venta generada #{venta_id}</h2>
@@ -1229,13 +1283,16 @@ def cobrar_boleta(
         <a class="btn btn-secondary" href="/boletas/cobradas">Ver cobradas</a>
     </div>
     """
-    return layout("Venta generada", body)
+    return layout(request, "Venta generada", body)
 
-
-# ---------- DEVOLUCIONES ----------
+# ---------------- DEVOLUCIONES (Bascula y Caja) ----------------
 
 @app.get("/devoluciones/nueva", response_class=HTMLResponse)
-def devolucion_form():
+def devolucion_form(request: Request):
+    guard = ensure_role(request, ["Caja", "Bascula"])
+    if guard:
+        return guard
+
     body = """
     <h2>Registrar devolución</h2>
     <div class="card">
@@ -1253,23 +1310,27 @@ def devolucion_form():
         </form>
     </div>
     """
-    return layout("Devolución", body)
-
+    return layout(request, "Devolución", body)
 
 @app.post("/devoluciones/nueva")
 def devolucion_crear(
+    request: Request,
     venta_id: int = Form(...),
     peso_devuelto_kg: float = Form(...),
     motivo: str = Form(""),
 ):
+    guard = ensure_role(request, ["Caja", "Bascula"])
+    if guard:
+        return guard
+
     conn = get_conn()
-    c = conn.cursor()
+    c = conn.cursor(cursor_factory=RealDictCursor) if IS_POSTGRES else conn.cursor()
 
     db_execute(c, "SELECT * FROM ventas WHERE id = ?", (venta_id,))
     venta = c.fetchone()
     if not venta:
-        conn.close()
-        return error_card("Venta no encontrada.")
+        close_conn(conn)
+        return error_card(request, "Venta no encontrada.")
 
     cliente_id = venta["cliente_id"]
     precio_por_kg = float(venta["precio_por_kg"])
@@ -1289,7 +1350,7 @@ def devolucion_crear(
         """, (fecha_hora, cliente_id, devolucion_id, -monto_devuelto))
 
     conn.commit()
-    conn.close()
+    close_conn(conn)
 
     body = f"""
     <h2>Devolución registrada</h2>
@@ -1300,13 +1361,16 @@ def devolucion_crear(
         <a class="btn btn-secondary" href="/">Volver al inicio</a>
     </div>
     """
-    return layout("Devolución registrada", body)
+    return layout(request, "Devolución registrada", body)
 
-
-# ---------- SALDOS ----------
+# ---------------- SALDOS (Caja) ----------------
 
 @app.get("/clientes/saldos", response_class=HTMLResponse)
-def saldo_selector():
+def saldo_selector(request: Request):
+    guard = ensure_role(request, ["Caja"])
+    if guard:
+        return guard
+
     clientes = get_clientes()
     opciones = "".join([f"<option value='{cl['id']}'>{cl['nombre']}</option>" for cl in clientes])
 
@@ -1320,19 +1384,22 @@ def saldo_selector():
         </form>
     </div>
     """
-    return layout("Saldos clientes", body)
-
+    return layout(request, "Saldos clientes", body)
 
 @app.get("/clientes/saldo", response_class=HTMLResponse)
-def saldo_cliente(cliente_id: int):
+def saldo_cliente(request: Request, cliente_id: int):
+    guard = ensure_role(request, ["Caja"])
+    if guard:
+        return guard
+
     conn = get_conn()
-    c = conn.cursor()
+    c = conn.cursor(cursor_factory=RealDictCursor) if IS_POSTGRES else conn.cursor()
 
     db_execute(c, "SELECT nombre FROM clientes WHERE id = ?", (cliente_id,))
     row = c.fetchone()
     if not row:
-        conn.close()
-        return error_card("Cliente no encontrado.")
+        close_conn(conn)
+        return error_card(request, "Cliente no encontrado.")
 
     nombre = row["nombre"]
 
@@ -1343,7 +1410,7 @@ def saldo_cliente(cliente_id: int):
         ORDER BY fecha_hora
     """, (cliente_id,))
     movs = c.fetchall()
-    conn.close()
+    close_conn(conn)
 
     saldo = 0.0
     filas = ""
@@ -1379,4 +1446,4 @@ def saldo_cliente(cliente_id: int):
         <p><strong>Saldo final:</strong> ${saldo:.2f}</p>
     </div>
     """
-    return layout("Saldo cliente", body)
+    return layout(request, "Saldo cliente", body)
