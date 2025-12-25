@@ -5,12 +5,12 @@ from fastapi.staticfiles import StaticFiles
 from datetime import datetime, date, timedelta
 import os, sqlite3
 from typing import Optional
+import hashlib, hmac
 
 import psycopg2
 from psycopg2.extras import RealDictCursor
 from psycopg2.pool import ThreadedConnectionPool
 from starlette.middleware.sessions import SessionMiddleware
-from passlib.context import CryptContext
 
 # ---------------- CONFIG ----------------
 
@@ -21,15 +21,20 @@ APP_SECRET = os.getenv("APP_SECRET", "dev-secret")
 
 IS_POSTGRES = bool(os.getenv("PGHOST"))
 
-# Usuarios (cámbialos en Railway/Supabase como variables de entorno)
+# Usuarios (Railway env vars)
 CAJA_PASSWORD = os.getenv("CAJA_PASSWORD", "caja123")
 BASCULA_PASSWORD = os.getenv("BASCULA_PASSWORD", "bascula123")
 
-pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+def _hash_password(p: str) -> str:
+    return hashlib.sha256(p.encode("utf-8")).hexdigest()
 
-# Hash en memoria (simple, sin tabla de usuarios)
-CAJA_PASSWORD_HASH = pwd_context.hash(CAJA_PASSWORD)
-BASCULA_PASSWORD_HASH = pwd_context.hash(BASCULA_PASSWORD)
+def verify_password(plain: str, stored_hash: str) -> bool:
+    return hmac.compare_digest(_hash_password(plain), stored_hash)
+
+# Puedes opcionalmente setear hashes directos en Railway:
+# CAJA_PASSWORD_HASH y BASCULA_PASSWORD_HASH
+CAJA_PASSWORD_HASH = os.getenv("CAJA_PASSWORD_HASH") or _hash_password(CAJA_PASSWORD)
+BASCULA_PASSWORD_HASH = os.getenv("BASCULA_PASSWORD_HASH") or _hash_password(BASCULA_PASSWORD)
 
 # Pool Postgres (más rápido que abrir/cerrar conexión en cada request)
 PG_POOL: Optional[ThreadedConnectionPool] = None
@@ -69,9 +74,7 @@ def get_conn():
     if IS_POSTGRES:
         if PG_POOL is None:
             init_pg_pool()
-        conn = PG_POOL.getconn()
-        conn.cursor_factory = RealDictCursor
-        return conn
+        return PG_POOL.getconn()
 
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
@@ -103,13 +106,13 @@ def insert_and_get_id(cur, query: str, params=()):
         q = query.replace("?", "%s").rstrip().rstrip(";") + " RETURNING id"
         cur.execute(q, params)
         row = cur.fetchone()
-        return row["id"]
+        return row["id"] if isinstance(row, dict) else row[0]
     cur.execute(query, params)
     return cur.lastrowid
 
 def init_db():
     conn = get_conn()
-    cur = conn.cursor()
+    cur = conn.cursor(cursor_factory=RealDictCursor) if IS_POSTGRES else conn.cursor()
 
     if IS_POSTGRES:
         cur.execute("""
@@ -260,7 +263,15 @@ def init_db():
 
     db_execute(cur, "SELECT COUNT(*) AS c FROM productos")
     count_row = cur.fetchone()
-    count_val = count_row["c"] if isinstance(count_row, dict) else count_row["c"]
+    # sqlite Row vs dict
+    if isinstance(count_row, dict):
+        count_val = count_row["c"]
+    else:
+        try:
+            count_val = count_row["c"]
+        except Exception:
+            count_val = count_row[0]
+
     if int(count_val) == 0:
         productos_seed = [
             ("Pollo entero", "POLLO_ENTERO"),
@@ -503,13 +514,13 @@ async def login_post(request: Request):
     password = (form.get("password") or "")
 
     if username == "Caja":
-        if pwd_context.verify(password, CAJA_PASSWORD_HASH):
+        if verify_password(password, CAJA_PASSWORD_HASH):
             request.session["role"] = "Caja"
             return RedirectResponse(url="/", status_code=303)
         return login_page(request, "Contraseña incorrecta.")
 
     if username == "Bascula":
-        if pwd_context.verify(password, BASCULA_PASSWORD_HASH):
+        if verify_password(password, BASCULA_PASSWORD_HASH):
             request.session["role"] = "Bascula"
             return RedirectResponse(url="/boletas/nueva", status_code=303)
         return login_page(request, "Contraseña incorrecta.")
@@ -1043,7 +1054,6 @@ def boletas_pendientes(request: Request):
 
     rows = ""
     for b in boletas:
-        # Si es Bascula, NO mostrar botón Cobrar
         accion_html = (
             f"<a class='btn btn-primary' href='/boletas/cobrar/{b['id']}'>Cobrar</a>"
             if role == "Caja"
