@@ -4,7 +4,7 @@ from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from datetime import datetime, date, timedelta
 import os, sqlite3
-from typing import Optional
+from typing import Optional, List, Dict, Any, Tuple
 
 import psycopg2
 from psycopg2.extras import RealDictCursor
@@ -18,17 +18,16 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DB_PATH = os.path.join(BASE_DIR, "rastro.db")
 
 APP_SECRET = os.getenv("APP_SECRET", "dev-secret")
-
 IS_POSTGRES = bool(os.getenv("PGHOST"))
 
 # Usuarios (Railway vars)
 CAJA_PASSWORD = os.getenv("CAJA_PASSWORD", "caja123")
 BASCULA_PASSWORD = os.getenv("BASCULA_PASSWORD", "bascula123")
 
-# OJO: usamos pbkdf2_sha256 (no bcrypt) para evitar broncas de bcrypt en deploy/local
+# pbkdf2_sha256 para evitar broncas bcrypt
 pwd_context = CryptContext(schemes=["pbkdf2_sha256"], deprecated="auto")
 
-# Hash en memoria (simple, sin tabla de usuarios)
+# Hash en memoria (simple)
 CAJA_PASSWORD_HASH = pwd_context.hash(CAJA_PASSWORD)
 BASCULA_PASSWORD_HASH = pwd_context.hash(BASCULA_PASSWORD)
 
@@ -44,6 +43,7 @@ app.add_middleware(SessionMiddleware, secret_key=APP_SECRET)
 STATIC_DIR = os.path.join(BASE_DIR, "static")
 os.makedirs(STATIC_DIR, exist_ok=True)
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
+
 
 # ---------------- DB HELPERS ----------------
 
@@ -149,6 +149,19 @@ def init_db():
             estado TEXT NOT NULL
         );
         """)
+        # NUEVO: detalle caja por caja
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS boleta_detalle (
+            id SERIAL PRIMARY KEY,
+            boleta_id INTEGER NOT NULL,
+            caja_num INTEGER NOT NULL,
+            tipo_caja TEXT,
+            peso_bruto_kg NUMERIC NOT NULL,
+            tara_kg NUMERIC NOT NULL,
+            peso_neto_kg NUMERIC NOT NULL,
+            creado_en TEXT NOT NULL
+        );
+        """)
         cur.execute("""
         CREATE TABLE IF NOT EXISTS ventas (
             id SERIAL PRIMARY KEY,
@@ -183,10 +196,19 @@ def init_db():
             motivo TEXT
         );
         """)
-        # índice recomendado para que /clientes vuele
+
+        # índices recomendados
         cur.execute("""
         CREATE INDEX IF NOT EXISTS idx_precios_lookup
         ON precios (producto_id, tipo_venta, fecha, cliente_id);
+        """)
+        cur.execute("""
+        CREATE INDEX IF NOT EXISTS idx_boleta_detalle_boleta
+        ON boleta_detalle (boleta_id, caja_num);
+        """)
+        cur.execute("""
+        CREATE INDEX IF NOT EXISTS idx_clientes_nombre
+        ON clientes (nombre);
         """)
     else:
         cur.execute("""
@@ -227,6 +249,19 @@ def init_db():
             estado TEXT NOT NULL
         );
         """)
+        # NUEVO: detalle caja por caja
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS boleta_detalle (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            boleta_id INTEGER NOT NULL,
+            caja_num INTEGER NOT NULL,
+            tipo_caja TEXT,
+            peso_bruto_kg REAL NOT NULL,
+            tara_kg REAL NOT NULL,
+            peso_neto_kg REAL NOT NULL,
+            creado_en TEXT NOT NULL
+        );
+        """)
         cur.execute("""
         CREATE TABLE IF NOT EXISTS ventas (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -262,6 +297,7 @@ def init_db():
         );
         """)
 
+    # Seed productos si vacío
     db_execute(cur, "SELECT COUNT(*) AS c FROM productos")
     count_row = cur.fetchone()
     count_val = count_row["c"] if isinstance(count_row, dict) else count_row["c"]
@@ -289,9 +325,10 @@ def _startup():
         init_pg_pool()
     init_db()
 
+
 # ---------------- AUTH / ROLES ----------------
 
-def ensure_role(request: Request, allowed_roles: list[str]):
+def ensure_role(request: Request, allowed_roles: List[str]):
     role = request.session.get("role")
     if not role:
         return RedirectResponse(url="/login", status_code=303)
@@ -450,6 +487,14 @@ def layout(request: Request, title: str, body: str) -> HTMLResponse:
             .actions form {{
                 display: inline;
             }}
+            .grid2 {{
+                display: grid;
+                grid-template-columns: 1fr 1fr;
+                gap: 12px;
+            }}
+            @media(max-width: 900px) {{
+                .grid2 {{ grid-template-columns: 1fr; }}
+            }}
         </style>
     </head>
     <body>
@@ -525,6 +570,7 @@ def logout(request: Request):
     request.session.clear()
     return RedirectResponse(url="/login", status_code=303)
 
+
 # ---------------- UTILIDADES ----------------
 
 def get_productos():
@@ -569,6 +615,39 @@ def obtener_precio(cliente_id, producto_id, fecha_txt, tipo_venta):
         return float(row["precio_por_kg"])
     return None
 
+def boleta_totales(boleta_id: int) -> Dict[str, float]:
+    """Totales desde boleta_detalle."""
+    conn = get_conn()
+    c = conn.cursor(cursor_factory=RealDictCursor) if IS_POSTGRES else conn.cursor()
+    db_execute(c, """
+        SELECT
+          COALESCE(COUNT(*),0) AS cajas,
+          COALESCE(SUM(peso_bruto_kg),0) AS bruto,
+          COALESCE(SUM(tara_kg),0) AS merma,
+          COALESCE(SUM(peso_neto_kg),0) AS neto
+        FROM boleta_detalle
+        WHERE boleta_id = ?
+    """, (boleta_id,))
+    r = c.fetchone()
+    close_conn(conn)
+    return {
+        "cajas": float(r["cajas"]),
+        "bruto": float(r["bruto"]),
+        "merma": float(r["merma"]),
+        "neto": float(r["neto"]),
+    }
+
+def actualizar_resumen_boleta(boleta_id: int):
+    """Actualiza boletas_pesaje.num_cajas y peso_total_kg (bruto total) para que se vea en listados."""
+    totals = boleta_totales(boleta_id)
+    conn = get_conn()
+    c = conn.cursor(cursor_factory=RealDictCursor) if IS_POSTGRES else conn.cursor()
+    db_execute(c, "UPDATE boletas_pesaje SET num_cajas = ?, peso_total_kg = ? WHERE id = ?",
+               (int(totals["cajas"]), float(totals["bruto"]), boleta_id))
+    conn.commit()
+    close_conn(conn)
+
+
 # ---------------- HOME ----------------
 
 @app.get("/", response_class=HTMLResponse)
@@ -581,22 +660,21 @@ def home(request: Request):
     <h2>Sistema Rastro Pollos</h2>
     <div class="card">
         <p>Flujo:</p>
-        <ul>
-            <li>Registrar clientes</li>
+        <ol>
             <li>Cargar lista de precios por día</li>
-            <li>Crear boleta de pesaje</li>
-            <li>Cobrar boletas pendientes</li>
+            <li>Nueva boleta</li>
+            <li>Capturar cajas (bruto + tara manual)</li>
+            <li>Cobrar boleta (usa neto real)</li>
             <li>Registrar devoluciones</li>
             <li>Ver saldos de clientes</li>
-        </ul>
+        </ol>
     </div>
     """
     return layout(request, "Inicio", body)
 
+
 # ---------------- CLIENTES (Caja) ----------------
-# MEJORAS:
-# 1) Paginación
-# 2) Precarga de precios (1 query) para evitar N+1 queries por cliente
+# (se queda igual que tu versión con paginación + precarga)
 
 @app.get("/clientes", response_class=HTMLResponse)
 def clientes_list(request: Request, q: str = "", page: int = 1):
@@ -619,14 +697,12 @@ def clientes_list(request: Request, q: str = "", page: int = 1):
     conn = get_conn()
     c = conn.cursor(cursor_factory=RealDictCursor) if IS_POSTGRES else conn.cursor()
 
-    # producto base (POLLO_ENTERO) para mostrar columnas antier/ayer/hoy
     db_execute(c, "SELECT id FROM productos WHERE codigo = 'POLLO_ENTERO'")
     row_prod = c.fetchone()
     producto_base_id = row_prod["id"] if row_prod else None
 
     q = (q or "").strip()
 
-    # total para paginación
     if q:
         if q.isdigit():
             db_execute(c, "SELECT COUNT(*) AS c FROM clientes WHERE id = ?", (int(q),))
@@ -639,7 +715,6 @@ def clientes_list(request: Request, q: str = "", page: int = 1):
     total = int(c.fetchone()["c"])
     total_pages = max(1, (total + PER_PAGE - 1) // PER_PAGE)
 
-    # página actual
     if q:
         if q.isdigit():
             db_execute(
@@ -659,15 +734,13 @@ def clientes_list(request: Request, q: str = "", page: int = 1):
 
     clientes = c.fetchall()
 
-    # ---- precargar precios (1 query) ----
-    precios_map = {}        # (cliente_id, fecha) -> precio
-    precios_general = {}    # fecha -> precio
+    precios_map = {}
+    precios_general = {}
 
     if producto_base_id is not None and clientes:
         ids = [cl["id"] for cl in clientes]
 
         if IS_POSTGRES:
-            # Cast explícito para ANY en postgres
             db_execute(c, """
                 SELECT cliente_id, fecha::text AS fecha, precio_por_kg
                 FROM precios
@@ -691,8 +764,6 @@ def clientes_list(request: Request, q: str = "", page: int = 1):
             """, tuple([producto_base_id] + fechas + ids))
 
         rows = c.fetchall()
-
-        # setdefault para quedarnos con el más reciente (ORDER BY id DESC)
         for r in rows:
             f = str(r["fecha"])
             cid = r["cliente_id"]
@@ -906,6 +977,7 @@ def cliente_ajuste_save(
     close_conn(conn)
     return RedirectResponse(url="/clientes", status_code=303)
 
+
 # ---------------- PRECIOS (Caja) ----------------
 
 @app.get("/precios", response_class=HTMLResponse)
@@ -1019,6 +1091,7 @@ async def precios_save(request: Request):
     close_conn(conn)
     return RedirectResponse(url="/precios", status_code=303)
 
+
 # ---------------- BOLETAS (Bascula y Caja) ----------------
 
 @app.get("/boletas/nueva", response_class=HTMLResponse)
@@ -1041,6 +1114,7 @@ def boleta_form(request: Request):
     body = f"""
     <h2>Nueva boleta de pesaje</h2>
     <div class="card">
+        <p><small>Ahora se captura <b>caja por caja</b> (bruto + tara manual). No se captura peso total aquí.</small></p>
         <form action="/boletas/nueva" method="post">
             <label>Cliente</label>
             <select name="cliente_id">{opciones_clientes}</select>
@@ -1055,19 +1129,13 @@ def boleta_form(request: Request):
                 <option value="menudeo">Menudeo</option>
             </select>
 
-            <label>Número de pollos</label>
+            <label>Número de pollos (total)</label>
             <input type="number" name="num_pollos" required />
-
-            <label>Número de cajas</label>
-            <input type="number" name="num_cajas" required />
-
-            <label>Peso total (kg) capturado a mano</label>
-            <input type="number" step="0.001" name="peso_total_kg" required />
 
             <label>Comentarios (opcional)</label>
             <textarea name="comentarios"></textarea>
 
-            <button class="btn btn-primary" type="submit">Crear boleta</button>
+            <button class="btn btn-primary" type="submit">Crear boleta y capturar cajas</button>
         </form>
     </div>
     """
@@ -1080,8 +1148,6 @@ def boleta_crear(
     producto_id: int = Form(...),
     tipo_venta: str = Form(...),
     num_pollos: int = Form(...),
-    num_cajas: int = Form(...),
-    peso_total_kg: float = Form(...),
     comentarios: str = Form(""),
 ):
     guard = ensure_role(request, ["Caja", "Bascula"])
@@ -1093,16 +1159,234 @@ def boleta_crear(
 
     conn = get_conn()
     c = conn.cursor(cursor_factory=RealDictCursor) if IS_POSTGRES else conn.cursor()
-    insert_and_get_id(c, """
+
+    # num_cajas y peso_total_kg arrancan en 0 (se calculan desde detalle)
+    boleta_id = insert_and_get_id(c, """
         INSERT INTO boletas_pesaje (fecha_hora, cliente_id, producto_id, tipo_venta,
                                    num_pollos, num_cajas, peso_total_kg,
                                    comentarios, estado)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'abierta')
-    """, (fecha_hora, cliente_id_val, producto_id, tipo_venta,
-          num_pollos, num_cajas, peso_total_kg, comentarios))
+        VALUES (?, ?, ?, ?, ?, 0, 0, ?, 'abierta')
+    """, (fecha_hora, cliente_id_val, producto_id, tipo_venta, int(num_pollos), comentarios))
+
     conn.commit()
     close_conn(conn)
-    return RedirectResponse(url="/boletas/pendientes", status_code=303)
+
+    return RedirectResponse(url=f"/boletas/{boleta_id}/cajas", status_code=303)
+
+
+# --------- Captura de cajas (bruto + tara manual) ---------
+
+@app.get("/boletas/{boleta_id}/cajas", response_class=HTMLResponse)
+def boleta_cajas(request: Request, boleta_id: int):
+    guard = ensure_role(request, ["Caja", "Bascula"])
+    if guard:
+        return guard
+
+    conn = get_conn()
+    c = conn.cursor(cursor_factory=RealDictCursor) if IS_POSTGRES else conn.cursor()
+
+    db_execute(c, """
+        SELECT b.*, p.nombre AS producto, p.codigo AS producto_codigo, cl.nombre AS cliente
+        FROM boletas_pesaje b
+        JOIN productos p ON p.id = b.producto_id
+        LEFT JOIN clientes cl ON cl.id = b.cliente_id
+        WHERE b.id = ?
+    """, (boleta_id,))
+    b = c.fetchone()
+    if not b:
+        close_conn(conn)
+        return error_card(request, "Boleta no encontrada.")
+
+    if b["estado"] != "abierta":
+        close_conn(conn)
+        return error_card(request, "La boleta ya está cerrada. No puedes modificar cajas.")
+
+    db_execute(c, """
+        SELECT id, caja_num, peso_bruto_kg, tara_kg, peso_neto_kg, creado_en
+        FROM boleta_detalle
+        WHERE boleta_id = ?
+        ORDER BY caja_num
+    """, (boleta_id,))
+    detalles = c.fetchall()
+    close_conn(conn)
+
+    totals = boleta_totales(boleta_id)
+    cajas_count = int(totals["cajas"])
+    bruto_total = totals["bruto"]
+    merma_total = totals["merma"]
+    neto_total = totals["neto"]
+
+    # Pollos por caja (repartido)
+    pollos_total = int(b["num_pollos"])
+    pollos_base = pollos_total // max(1, cajas_count) if cajas_count > 0 else 0
+    pollos_extra = pollos_total % max(1, cajas_count) if cajas_count > 0 else 0
+
+    cliente_txt = b["cliente"] if b["cliente"] is not None else "OTRO / contado"
+
+    filas = ""
+    for idx, d in enumerate(detalles):
+        # Reparto pollos: primeras "pollos_extra" cajas llevan +1
+        pollos_caja = 0
+        if cajas_count > 0:
+            pollos_caja = pollos_base + (1 if idx < pollos_extra else 0)
+
+        filas += f"""
+        <tr>
+          <td>{d['caja_num']}</td>
+          <td>{float(d['peso_bruto_kg']):.3f}</td>
+          <td>{float(d['tara_kg']):.3f}</td>
+          <td>{float(d['peso_neto_kg']):.3f}</td>
+          <td>{pollos_caja}</td>
+          <td class="actions">
+            <form method="post" action="/boletas/{boleta_id}/cajas/borrar/{d['id']}" style="display:inline;">
+              <button class="btn btn-danger" type="submit"
+                onclick="return confirm('¿Borrar esta caja?')">Borrar</button>
+            </form>
+          </td>
+        </tr>
+        """
+
+    body = f"""
+    <h2>Capturar cajas — Boleta #{boleta_id}</h2>
+
+    <div class="card">
+      <div class="grid2">
+        <div>
+          <p><b>Cliente:</b> {cliente_txt}</p>
+          <p><b>Producto:</b> {b['producto']} <small>({b['producto_codigo']})</small></p>
+          <p><b>Tipo venta:</b> {b['tipo_venta']}</p>
+        </div>
+        <div>
+          <p><b>Pollos total:</b> {pollos_total}</p>
+          <p><b>Cajas capturadas:</b> {cajas_count}</p>
+          <p><b>Bruto:</b> {bruto_total:.3f} kg | <b>Merma:</b> {merma_total:.3f} kg | <b>Neto:</b> {neto_total:.3f} kg</p>
+        </div>
+      </div>
+    </div>
+
+    <div class="card">
+      <h3>Agregar caja</h3>
+      <form method="post" action="/boletas/{boleta_id}/cajas/agregar">
+        <label>Peso bruto (kg)</label>
+        <input type="number" step="0.001" name="peso_bruto_kg" required />
+
+        <label>Peso de la caja / Tara (kg)</label>
+        <input type="number" step="0.001" name="tara_kg" required />
+
+        <button class="btn btn-primary" type="submit">Agregar caja</button>
+        <a class="btn btn-secondary" href="/boletas/pendientes">Ir a pendientes</a>
+      </form>
+      <p><small>Tip: si se equivocan, borra la caja y vuelve a capturarla.</small></p>
+    </div>
+
+    <div class="card">
+      <h3>Detalle de cajas</h3>
+      <table>
+        <thead>
+          <tr>
+            <th># Caja</th>
+            <th>Bruto (kg)</th>
+            <th>Tara (kg)</th>
+            <th>Neto (kg)</th>
+            <th>Pollos (repartido)</th>
+            <th>Acción</th>
+          </tr>
+        </thead>
+        <tbody>
+          {filas or "<tr><td colspan='6'>Aún no capturas cajas.</td></tr>"}
+        </tbody>
+      </table>
+    </div>
+
+    <div class="card">
+      <h3>¿Listo para cobrar?</h3>
+      <p>Cuando ya tengas todas las cajas, la Caja puede cobrar usando el <b>neto real</b>.</p>
+      <a class="btn btn-primary" href="/boletas/cobrar/{boleta_id}">Ir a cobrar</a>
+    </div>
+    """
+    return layout(request, f"Cajas boleta {boleta_id}", body)
+
+@app.post("/boletas/{boleta_id}/cajas/agregar")
+def boleta_caja_agregar(
+    request: Request,
+    boleta_id: int,
+    peso_bruto_kg: float = Form(...),
+    tara_kg: float = Form(...),
+):
+    guard = ensure_role(request, ["Caja", "Bascula"])
+    if guard:
+        return guard
+
+    peso_bruto = float(peso_bruto_kg)
+    tara = float(tara_kg)
+
+    if peso_bruto <= 0:
+        return error_card(request, "El peso bruto debe ser mayor a 0.")
+    if tara < 0:
+        return error_card(request, "La tara no puede ser negativa.")
+
+    peso_neto = peso_bruto - tara
+    if peso_neto <= 0:
+        return error_card(request, "El neto quedó <= 0. Revisa bruto y tara.")
+
+    conn = get_conn()
+    c = conn.cursor(cursor_factory=RealDictCursor) if IS_POSTGRES else conn.cursor()
+
+    db_execute(c, "SELECT estado FROM boletas_pesaje WHERE id = ?", (boleta_id,))
+    br = c.fetchone()
+    if not br:
+        close_conn(conn)
+        return error_card(request, "Boleta no encontrada.")
+    if br["estado"] != "abierta":
+        close_conn(conn)
+        return error_card(request, "Boleta cerrada. No se puede agregar caja.")
+
+    db_execute(c, "SELECT COALESCE(MAX(caja_num), 0) AS m FROM boleta_detalle WHERE boleta_id = ?", (boleta_id,))
+    m = c.fetchone()
+    next_num = int(m["m"]) + 1
+
+    creado_en = datetime.now().isoformat(timespec="seconds")
+
+    insert_and_get_id(c, """
+        INSERT INTO boleta_detalle (boleta_id, caja_num, tipo_caja, peso_bruto_kg, tara_kg, peso_neto_kg, creado_en)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+    """, (boleta_id, next_num, "manual", peso_bruto, tara, peso_neto, creado_en))
+
+    conn.commit()
+    close_conn(conn)
+
+    # actualiza resumen
+    actualizar_resumen_boleta(boleta_id)
+
+    return RedirectResponse(url=f"/boletas/{boleta_id}/cajas", status_code=303)
+
+@app.post("/boletas/{boleta_id}/cajas/borrar/{detalle_id}")
+def boleta_caja_borrar(request: Request, boleta_id: int, detalle_id: int):
+    guard = ensure_role(request, ["Caja", "Bascula"])
+    if guard:
+        return guard
+
+    conn = get_conn()
+    c = conn.cursor(cursor_factory=RealDictCursor) if IS_POSTGRES else conn.cursor()
+
+    db_execute(c, "SELECT estado FROM boletas_pesaje WHERE id = ?", (boleta_id,))
+    br = c.fetchone()
+    if not br:
+        close_conn(conn)
+        return error_card(request, "Boleta no encontrada.")
+    if br["estado"] != "abierta":
+        close_conn(conn)
+        return error_card(request, "Boleta cerrada. No se puede borrar caja.")
+
+    db_execute(c, "DELETE FROM boleta_detalle WHERE id = ? AND boleta_id = ?", (detalle_id, boleta_id))
+    conn.commit()
+    close_conn(conn)
+
+    actualizar_resumen_boleta(boleta_id)
+    return RedirectResponse(url=f"/boletas/{boleta_id}/cajas", status_code=303)
+
+
+# --------- Boletas pendientes / cobradas ---------
 
 @app.get("/boletas/pendientes", response_class=HTMLResponse)
 def boletas_pendientes(request: Request):
@@ -1114,8 +1398,10 @@ def boletas_pendientes(request: Request):
 
     conn = get_conn()
     c = conn.cursor(cursor_factory=RealDictCursor) if IS_POSTGRES else conn.cursor()
+
+    # Traemos boletas abiertas
     db_execute(c, """
-        SELECT b.id, b.fecha_hora, b.peso_total_kg, b.num_pollos, b.num_cajas,
+        SELECT b.id, b.fecha_hora, b.num_pollos, b.num_cajas, b.peso_total_kg,
                b.tipo_venta, p.nombre AS producto
         FROM boletas_pesaje b
         JOIN productos p ON p.id = b.producto_id
@@ -1123,26 +1409,70 @@ def boletas_pendientes(request: Request):
         ORDER BY b.fecha_hora
     """)
     boletas = c.fetchall()
+
+    # Totales por boleta en una sola consulta (evita N+1)
+    ids = [b["id"] for b in boletas]
+    totals_map: Dict[int, Dict[str, float]] = {}
+    if ids:
+        if IS_POSTGRES:
+            db_execute(c, """
+                SELECT
+                  boleta_id,
+                  COUNT(*)::float AS cajas,
+                  COALESCE(SUM(peso_bruto_kg),0)::float AS bruto,
+                  COALESCE(SUM(tara_kg),0)::float AS merma,
+                  COALESCE(SUM(peso_neto_kg),0)::float AS neto
+                FROM boleta_detalle
+                WHERE boleta_id = ANY(%s::int[])
+                GROUP BY boleta_id
+            """, (ids,))
+        else:
+            ph = ",".join(["?"] * len(ids))
+            db_execute(c, f"""
+                SELECT
+                  boleta_id,
+                  COUNT(*) AS cajas,
+                  COALESCE(SUM(peso_bruto_kg),0) AS bruto,
+                  COALESCE(SUM(tara_kg),0) AS merma,
+                  COALESCE(SUM(peso_neto_kg),0) AS neto
+                FROM boleta_detalle
+                WHERE boleta_id IN ({ph})
+                GROUP BY boleta_id
+            """, tuple(ids))
+
+        for r in c.fetchall():
+            totals_map[int(r["boleta_id"])] = {
+                "cajas": float(r["cajas"]),
+                "bruto": float(r["bruto"]),
+                "merma": float(r["merma"]),
+                "neto": float(r["neto"]),
+            }
+
     close_conn(conn)
 
     rows = ""
     for b in boletas:
+        t = totals_map.get(int(b["id"]), {"cajas": 0, "bruto": 0, "merma": 0, "neto": 0})
         accion_html = (
             f"<a class='btn btn-primary' href='/boletas/cobrar/{b['id']}'>Cobrar</a>"
             if role == "Caja"
             else "<span style='color:#6b7280; font-size:12px;'>—</span>"
         )
-
         rows += f"""
         <tr>
             <td>{b['id']}</td>
             <td>{b['fecha_hora']}</td>
             <td>{b['producto']}</td>
             <td>{b['num_pollos']}</td>
-            <td>{b['num_cajas']}</td>
-            <td>{float(b['peso_total_kg']):.3f}</td>
+            <td>{int(t['cajas'])}</td>
+            <td>{t['bruto']:.3f}</td>
+            <td>{t['merma']:.3f}</td>
+            <td>{t['neto']:.3f}</td>
             <td>{b['tipo_venta']}</td>
-            <td>{accion_html}</td>
+            <td class="actions">
+              <a class="btn btn-secondary" href="/boletas/{b['id']}/cajas">Capturar cajas</a>
+              {accion_html}
+            </td>
         </tr>
         """
 
@@ -1157,13 +1487,15 @@ def boletas_pendientes(request: Request):
                     <th>Producto</th>
                     <th>Pollos</th>
                     <th>Cajas</th>
-                    <th>Peso total (kg)</th>
+                    <th>Bruto (kg)</th>
+                    <th>Merma (kg)</th>
+                    <th>Neto (kg)</th>
                     <th>Tipo venta</th>
-                    <th>Acción</th>
+                    <th>Acciones</th>
                 </tr>
             </thead>
             <tbody>
-                {rows or "<tr><td colspan='8'>No hay boletas abiertas</td></tr>"}
+                {rows or "<tr><td colspan='10'>No hay boletas abiertas</td></tr>"}
             </tbody>
         </table>
     </div>
@@ -1248,6 +1580,9 @@ def boletas_cobradas(request: Request):
     """
     return layout(request, "Boletas cobradas", body)
 
+
+# --------- Cobro: usa neto real desde boleta_detalle ---------
+
 @app.get("/boletas/cobrar/{boleta_id}", response_class=HTMLResponse)
 def cobrar_boleta_form(request: Request, boleta_id: int):
     guard = ensure_role(request, ["Caja"])
@@ -1267,19 +1602,24 @@ def cobrar_boleta_form(request: Request, boleta_id: int):
 
     if not boleta:
         return error_card(request, "Boleta no encontrada.")
+    if boleta["estado"] != "abierta":
+        return error_card(request, "La boleta ya está cerrada.")
+
+    totals = boleta_totales(boleta_id)
+    if int(totals["cajas"]) <= 0:
+        return error_card(request, "No hay cajas capturadas. Primero captura cajas.")
 
     body = f"""
     <h2>Cobrar boleta #{boleta_id}</h2>
     <div class="card">
         <p><strong>Producto:</strong> {boleta['producto']}</p>
-        <p><strong>Pollos:</strong> {boleta['num_pollos']} | <strong>Cajas:</strong> {boleta['num_cajas']}</p>
-        <p><strong>Peso total:</strong> {float(boleta['peso_total_kg']):.3f} kg</p>
+        <p><strong>Pollos:</strong> {boleta['num_pollos']}</p>
+        <p><strong>Cajas:</strong> {int(totals['cajas'])}</p>
+        <p><strong>Bruto:</strong> {totals['bruto']:.3f} kg | <strong>Merma:</strong> {totals['merma']:.3f} kg</p>
+        <p><strong>Peso neto a cobrar:</strong> <b>{totals['neto']:.3f} kg</b></p>
         <p><strong>Tipo de venta:</strong> {boleta['tipo_venta']}</p>
 
         <form action="/boletas/cobrar/{boleta_id}" method="post">
-            <label>Peso estimado de cada caja (kg) para merma</label>
-            <input type="number" step="0.001" name="peso_caja_kg" required />
-
             <label>Método de pago</label>
             <select name="metodo_pago">
                 <option value="efectivo">Efectivo</option>
@@ -1288,6 +1628,7 @@ def cobrar_boleta_form(request: Request, boleta_id: int):
             </select>
 
             <button class="btn btn-primary" type="submit">Calcular y cobrar</button>
+            <a class="btn btn-secondary" href="/boletas/{boleta_id}/cajas">Volver a cajas</a>
         </form>
     </div>
     """
@@ -1297,7 +1638,6 @@ def cobrar_boleta_form(request: Request, boleta_id: int):
 def cobrar_boleta(
     request: Request,
     boleta_id: int,
-    peso_caja_kg: float = Form(...),
     metodo_pago: str = Form(...),
 ):
     guard = ensure_role(request, ["Caja"])
@@ -1317,8 +1657,16 @@ def cobrar_boleta(
         close_conn(conn)
         return error_card(request, "La boleta ya fue cerrada.")
 
-    peso_total = float(boleta["peso_total_kg"])
-    num_cajas = int(boleta["num_cajas"])
+    totals = boleta_totales(boleta_id)
+    if int(totals["cajas"]) <= 0:
+        close_conn(conn)
+        return error_card(request, "No hay cajas capturadas. No se puede cobrar.")
+
+    peso_neto = float(totals["neto"])
+    if peso_neto <= 0:
+        close_conn(conn)
+        return error_card(request, "Peso neto <= 0. Revisa cajas.")
+
     cliente_id = boleta["cliente_id"]
     producto_id = boleta["producto_id"]
     tipo_venta = boleta["tipo_venta"]
@@ -1329,11 +1677,6 @@ def cobrar_boleta(
     if precio_por_kg is None:
         close_conn(conn)
         return error_card(request, "No hay precio configurado para ese día/cliente/tipo.")
-
-    peso_neto = peso_total - (num_cajas * float(peso_caja_kg))
-    if peso_neto <= 0:
-        close_conn(conn)
-        return error_card(request, "Peso neto menor o igual a 0. Revisa datos.")
 
     total = round(peso_neto * float(precio_por_kg), 2)
 
@@ -1355,6 +1698,36 @@ def cobrar_boleta(
     conn.commit()
     close_conn(conn)
 
+    # Construir "nota" caja por caja
+    conn = get_conn()
+    c = conn.cursor(cursor_factory=RealDictCursor) if IS_POSTGRES else conn.cursor()
+    db_execute(c, """
+        SELECT caja_num, peso_bruto_kg, tara_kg, peso_neto_kg
+        FROM boleta_detalle
+        WHERE boleta_id = ?
+        ORDER BY caja_num
+    """, (boleta_id,))
+    det = c.fetchall()
+    close_conn(conn)
+
+    cajas_count = len(det)
+    pollos_total = int(boleta["num_pollos"])
+    pollos_base = pollos_total // max(1, cajas_count) if cajas_count > 0 else 0
+    pollos_extra = pollos_total % max(1, cajas_count) if cajas_count > 0 else 0
+
+    filas = ""
+    for i, d in enumerate(det):
+        pollos_caja = pollos_base + (1 if i < pollos_extra else 0) if cajas_count > 0 else 0
+        filas += f"""
+        <tr>
+          <td>{d['caja_num']}</td>
+          <td>{float(d['peso_bruto_kg']):.3f}</td>
+          <td>{float(d['tara_kg']):.3f}</td>
+          <td>{float(d['peso_neto_kg']):.3f}</td>
+          <td>{pollos_caja}</td>
+        </tr>
+        """
+
     body = f"""
     <h2>Venta generada #{venta_id}</h2>
     <div class="card">
@@ -1365,8 +1738,28 @@ def cobrar_boleta(
         <a class="btn btn-secondary" href="/boletas/pendientes">Volver a pendientes</a>
         <a class="btn btn-secondary" href="/boletas/cobradas">Ver cobradas</a>
     </div>
+
+    <div class="card">
+      <h3>Nota (caja por caja)</h3>
+      <p><b>Bruto:</b> {totals['bruto']:.3f} kg | <b>Merma:</b> {totals['merma']:.3f} kg | <b>Neto:</b> {totals['neto']:.3f} kg</p>
+      <table>
+        <thead>
+          <tr>
+            <th># Caja</th>
+            <th>Bruto (kg)</th>
+            <th>Tara (kg)</th>
+            <th>Neto (kg)</th>
+            <th>Pollos (repartido)</th>
+          </tr>
+        </thead>
+        <tbody>
+          {filas}
+        </tbody>
+      </table>
+    </div>
     """
     return layout(request, "Venta generada", body)
+
 
 # ---------------- DEVOLUCIONES (Bascula y Caja) ----------------
 
@@ -1445,6 +1838,7 @@ def devolucion_crear(
     </div>
     """
     return layout(request, "Devolución registrada", body)
+
 
 # ---------------- SALDOS (Caja) ----------------
 
